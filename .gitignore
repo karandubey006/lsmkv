@@ -1,0 +1,22 @@
+# Private documentation: README.md is the only public doc
+docs/
+LSM-tree-storage-engine-build-plan.md
+CLAUDE.md
+.claude/
+
+# Build output
+build/
+out/
+cmake-build-*/
+compile_commands.json
+CMakeUserPresets.json
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Python (crash/bench scripts)
+__pycache__/
+*.pyc
+.venv/
