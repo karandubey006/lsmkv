@@ -90,6 +90,21 @@ int VarintLength(uint64_t value) {
   return len;
 }
 
+char* EncodeVarint32(char* dst, uint32_t value) {
+  while (value >= 0x80) {
+    *dst++ = static_cast<char>((value & 0x7F) | 0x80);
+    value >>= 7;
+  }
+  *dst++ = static_cast<char>(value);
+  return dst;
+}
+
+const char* GetVarint32Ptr(const char* p, const char* limit, uint32_t* value) {
+  std::string_view input(p, static_cast<size_t>(limit - p));
+  if (!GetVarint32(&input, value)) return nullptr;
+  return input.data();
+}
+
 void PutLengthPrefixed(std::string* dst, std::string_view value) {
   PutVarint32(dst, static_cast<uint32_t>(value.size()));
   dst->append(value);

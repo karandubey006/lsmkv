@@ -30,6 +30,7 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(lsmkv STATIC
   src/db/db.cc
+  src/db/dbformat.cc
   src/db/map_db.cc
   src/db/write_batch.cc
   src/env/env.cc
@@ -62,6 +63,7 @@ if(LSMKV_BUILD_TESTS)
   add_executable(lsmkv_tests
     tests/coding_test.cc
     tests/db_test.cc
+    tests/dbformat_test.cc
     tests/differential_test.cc
     tests/env_test.cc
     tests/status_test.cc

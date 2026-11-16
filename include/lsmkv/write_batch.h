@@ -17,11 +17,9 @@ namespace lsmkv {
 // the write-ahead log as a single record without re-encoding:
 //
 //   rep := count:fixed32  record*
-//   record := kPut    key:varstring value:varstring
-//           | kDelete key:varstring
+//   record := kValue    key:varstring value:varstring     (a Put;    tag byte 1)
+//           | kDeletion key:varstring                    (a Delete; tag byte 0)
 //   varstring := length:varint32 bytes[length]
-//
-// Phase 2 will extend the header with a sequence number.
 class WriteBatch {
  public:
   // Callback interface for Iterate().

@@ -110,5 +110,21 @@ TEST(CodingTest, LengthPrefixedRejectsShortBody) {
   EXPECT_EQ(input.size(), s.size());
 }
 
+TEST(CodingTest, PointerVarint32MatchesStringForm) {
+  for (uint32_t v : {0u, 1u, 127u, 128u, 300u, 16383u, 16384u, 0xFFFFFFFFu}) {
+    char buf[5];
+    char* end = EncodeVarint32(buf, v);
+    std::string expected;
+    PutVarint32(&expected, v);
+    ASSERT_EQ(std::string(buf, end), expected) << v;
+
+    uint32_t decoded = 0;
+    EXPECT_EQ(GetVarint32Ptr(buf, end, &decoded), end) << v;
+    EXPECT_EQ(decoded, v);
+    // One byte short is truncated.
+    EXPECT_EQ(GetVarint32Ptr(buf, end - 1, &decoded), nullptr) << v;
+  }
+}
+
 }  // namespace
 }  // namespace lsmkv

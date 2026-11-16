@@ -29,6 +29,12 @@ bool GetVarint32(std::string_view* input, uint32_t* value);
 bool GetVarint64(std::string_view* input, uint64_t* value);
 int VarintLength(uint64_t value);
 
+// Pointer forms. EncodeVarint32 writes at most 5 bytes and returns the end.
+// GetVarint32Ptr parses from [p, limit) and returns the byte after the varint,
+// or nullptr on error.
+char* EncodeVarint32(char* dst, uint32_t value);
+const char* GetVarint32Ptr(const char* p, const char* limit, uint32_t* value);
+
 // Length-prefixed byte string: varint32 length, then the bytes.
 void PutLengthPrefixed(std::string* dst, std::string_view value);
 bool GetLengthPrefixed(std::string_view* input, std::string_view* result);
