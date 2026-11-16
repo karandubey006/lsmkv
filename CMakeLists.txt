@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(LSMKV_BUILD_TESTS "Build the lsmkv test suite" ON)
 option(LSMKV_WERROR "Treat compiler warnings as errors" OFF)
+option(LSMKV_BUILD_BENCH "Build the microbenchmarks (Google Benchmark)" OFF)
 set(LSMKV_SANITIZE "" CACHE STRING
     "Sanitizers to build with, e.g. 'address,undefined' or 'thread' (empty = none)")
 
@@ -81,4 +82,26 @@ if(LSMKV_BUILD_TESTS)
 
   include(GoogleTest)
   gtest_discover_tests(lsmkv_tests DISCOVERY_MODE PRE_TEST)
+endif()
+
+# ---------------------------------------------------------------------------
+# Microbenchmarks (on in the release preset; numbers only mean anything there)
+# ---------------------------------------------------------------------------
+if(LSMKV_BUILD_BENCH)
+  include(FetchContent)
+  FetchContent_Declare(googlebenchmark
+    URL https://github.com/google/benchmark/archive/refs/tags/v1.9.5.tar.gz
+    URL_HASH SHA256=9631341c82bac4a288bef951f8b26b41f69021794184ece969f8473977eaa340
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    SYSTEM
+  )
+  set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+  set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
+  set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+  set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(googlebenchmark)
+
+  add_executable(memtable_bench bench/memtable_bench.cc)
+  target_include_directories(memtable_bench PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  target_link_libraries(memtable_bench PRIVATE lsmkv lsmkv_warnings benchmark::benchmark)
 endif()

@@ -40,7 +40,7 @@
       "name": "release",
       "inherits": "base",
       "displayName": "Release (-O3, for benchmarks)",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "LSMKV_BUILD_BENCH": "ON" }
     }
   ],
   "buildPresets": [

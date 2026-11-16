@@ -1,5 +1,5 @@
 # Thin wrapper over the CMake presets. `make test` is what CI and a fresh clone run.
-.PHONY: test tsan debug release clean
+.PHONY: test tsan debug release bench-micro clean
 
 # On macOS, prefer Homebrew's LLVM: the sanitizer runtimes in older Xcode
 # toolchains abort at startup on newer macOS releases. An explicit CXX wins.
@@ -31,6 +31,9 @@ debug:
 release:
 	cmake --preset release
 	cmake --build --preset release
+
+bench-micro: release   ## MemTable vs std::map microbenchmark (release build)
+	./build/release/memtable_bench
 
 clean:
 	rm -rf build
