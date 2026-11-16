@@ -36,6 +36,7 @@ add_library(lsmkv STATIC
   src/env/env.cc
   src/env/posix_env.cc
   src/memtable/arena.cc
+  src/memtable/memtable.cc
   src/util/coding.cc
   src/util/status.cc
 )
@@ -68,6 +69,7 @@ if(LSMKV_BUILD_TESTS)
     tests/dbformat_test.cc
     tests/differential_test.cc
     tests/env_test.cc
+    tests/memtable_test.cc
     tests/skiplist_test.cc
     tests/status_test.cc
     tests/write_batch_test.cc
