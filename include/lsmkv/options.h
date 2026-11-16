@@ -17,18 +17,17 @@ struct Options {
   Env* env = nullptr;
 };
 
-// Per-write options (design decision D3: options structs from day one).
+// Per-write options.
 struct WriteOptions {
   // If true, the write is fsynced to the WAL before Put/Delete/Write returns,
   // so an acknowledged write survives power loss. If false, it survives a
   // process crash but may be lost on power loss.
   //
-  // Phase 0: accepted but has no effect (the stand-in engine has no WAL).
+  // Not yet implemented: the current engine keeps no data on disk.
   bool sync = false;
 };
 
-// Per-read options. Fields (snapshot, verify_checksums, fill_cache) arrive in
-// Phase 4; the struct exists now so no call site changes when they do.
+// Per-read options. Currently empty.
 struct ReadOptions {};
 
 }  // namespace lsmkv

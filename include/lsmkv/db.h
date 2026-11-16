@@ -12,7 +12,7 @@
 namespace lsmkv {
 
 // An embedded, ordered key-value store. Keys and values are arbitrary byte
-// strings (design decision D2: std::string_view, which may contain '\0').
+// strings (std::string_view, which may contain '\0').
 // Keys are ordered byte-wise, comparing bytes as unsigned.
 //
 // A DB is safe to use from multiple threads at once without external locking.

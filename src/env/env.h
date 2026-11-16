@@ -1,12 +1,8 @@
 #pragma once
 
 // Env: the single interface through which lsmkv touches the filesystem.
-//
-// Nothing outside src/env/ may call open/write/fsync/rename/... directly.
-// That rule is what lets Phase 2's FaultInjectionEnv simulate power loss: it
-// wraps a real Env, records how many bytes of each file have been synced, and
-// on command truncates every file to its synced length and forgets directory
-// entries that were never synced.
+// Nothing outside src/env/ may call open/write/fsync/rename/... directly, so
+// tests can substitute an Env that simulates power loss.
 //
 // Paths are `const std::string&`, not string_view, because every system call
 // needs a NUL-terminated string.

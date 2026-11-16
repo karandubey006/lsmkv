@@ -304,8 +304,8 @@ class PosixEnv final : public Env {
 }  // namespace
 
 Env* Env::Default() {
-  // Intentionally leaked: background threads (from Phase 3 on) may still be
-  // using the Env while static destructors run at exit.
+  // Intentionally leaked: background threads may still use the Env while
+  // static destructors run at exit.
   static Env* const env = new PosixEnv;
   return env;
 }

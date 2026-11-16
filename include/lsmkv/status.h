@@ -7,9 +7,8 @@
 
 namespace lsmkv {
 
-// The result of every fallible operation (design decision D1: Status return
-// values, not exceptions). Marked [[nodiscard]] so silently dropping an error
-// is a compiler warning (and an error under -Werror).
+// The result of every fallible operation; lsmkv never throws. Marked
+// [[nodiscard]] so silently dropping an error is a compiler warning.
 //
 // Cost model: an OK status is a single null pointer, so the success path never
 // allocates. Only errors carry a heap-allocated code + message.

@@ -5,7 +5,7 @@
 namespace lsmkv {
 
 Status DB::Open(const Options& options, const std::string& name, std::unique_ptr<DB>* dbptr) {
-  // Phase 0: the std::map stand-in. Replaced by DBImpl from Phase 1 on.
+  // The std::map stand-in, until the LSM-tree engine replaces it.
   return OpenMapDB(options, name, dbptr);
 }
 

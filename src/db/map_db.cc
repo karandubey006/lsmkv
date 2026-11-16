@@ -18,8 +18,7 @@ using Map = std::map<std::string, std::string, std::less<>>;
 
 // One immutable-once-shared copy of the data. Iterators pin a Version so their
 // snapshot stays alive and unchanged; a write that finds the current Version
-// pinned copies it first (copy-on-write). This is a toy version of the
-// reference-counted Versions that Phase 5 builds for SSTables.
+// pinned copies it first (copy-on-write).
 struct Version {
   Map map;
   // The one field that still changes after a Version is shared, so it is
