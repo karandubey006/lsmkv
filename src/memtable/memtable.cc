@@ -17,6 +17,13 @@ std::string_view ValueOf(std::string_view internal_key) {
   return {p, size};
 }
 
+// Copies src to dst and returns the end. memcpy's pointers must be non-null
+// even for zero bytes, and an empty string_view's data() may be null.
+char* CopyBytes(char* dst, std::string_view src) {
+  if (!src.empty()) std::memcpy(dst, src.data(), src.size());
+  return dst + src.size();
+}
+
 }  // namespace
 
 void MemTable::Add(SequenceNumber sequence, ValueType type, std::string_view user_key,
@@ -26,11 +33,10 @@ void MemTable::Add(SequenceNumber sequence, ValueType type, std::string_view use
   const size_t size = key_size + static_cast<size_t>(VarintLength(value.size())) + value.size();
 
   char* const entry = arena_.Allocate(size);
-  std::memcpy(entry, user_key.data(), user_key.size());
-  EncodeFixed64(entry + user_key.size(), PackTrailer(sequence, type));
+  EncodeFixed64(CopyBytes(entry, user_key), PackTrailer(sequence, type));
   char* p = EncodeVarint32(entry + key_size, static_cast<uint32_t>(value.size()));
-  std::memcpy(p, value.data(), value.size());
-  assert(p + value.size() == entry + size);
+  p = CopyBytes(p, value);
+  assert(p == entry + size);
 
   table_.Insert(std::string_view(entry, key_size));
 }
