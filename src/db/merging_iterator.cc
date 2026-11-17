@@ -1,6 +1,7 @@
 #include "db/merging_iterator.h"
 
 #include <algorithm>
+#include <cassert>
 
 #include "db/dbformat.h"
 
@@ -27,6 +28,7 @@ class MergingIterator final : public Iterator {
   }
 
   void Next() override {
+    assert(Valid());
     // pop_heap moves the smallest child to the back, outside the heap, so
     // advancing it can't break the heap order.
     std::pop_heap(heap_.begin(), heap_.end(), HasLargerKey);
@@ -39,8 +41,14 @@ class MergingIterator final : public Iterator {
     }
   }
 
-  std::string_view key() const override { return heap_.front()->key(); }
-  std::string_view value() const override { return heap_.front()->value(); }
+  std::string_view key() const override {
+    assert(Valid());
+    return heap_.front()->key();
+  }
+  std::string_view value() const override {
+    assert(Valid());
+    return heap_.front()->value();
+  }
 
   Status status() const override {
     for (const auto& child : children_) {

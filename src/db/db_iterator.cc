@@ -1,5 +1,6 @@
 #include "db/db_iterator.h"
 
+#include <cassert>
 #include <string>
 
 namespace lsmkv {
@@ -24,14 +25,21 @@ class DBIterator final : public Iterator {
   }
 
   void Next() override {
+    assert(valid_);
     // Every older version of the current key comes next; pass over them.
     skip_.assign(key());
     internal_->Next();
     FindVisibleEntry(/*skipping=*/true);
   }
 
-  std::string_view key() const override { return UserKeyOf(internal_->key()); }
-  std::string_view value() const override { return internal_->value(); }
+  std::string_view key() const override {
+    assert(valid_);
+    return UserKeyOf(internal_->key());
+  }
+  std::string_view value() const override {
+    assert(valid_);
+    return internal_->value();
+  }
 
   Status status() const override {
     if (!status_.ok()) return status_;

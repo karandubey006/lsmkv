@@ -280,9 +280,12 @@ TEST_F(LsmDBTest, ConcurrentReadsDuringRotation) {
       while (!done) {
         auto it = db_->NewIterator(ReadOptions());
         it->Seek("a");
-        const std::string a = it->Valid() ? std::string(it->value()) : "0";
-        it->Next();
-        const std::string b = it->Valid() && it->key() == "b" ? std::string(it->value()) : "0";
+        std::string a = "0", b = "0";  // before the first batch, neither key exists
+        if (it->Valid() && it->key() == "a") {
+          a = it->value();
+          it->Next();
+          if (it->Valid() && it->key() == "b") b = it->value();
+        }
         if (a != b) errors++;  // torn batch
         std::string got;
         Status s = db_->Get(ReadOptions(), "a", &got);
