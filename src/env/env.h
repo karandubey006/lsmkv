@@ -131,4 +131,7 @@ class Env {
 // Returns InvalidArgument unless name is a single path component.
 Status CheckFileName(std::string_view name);
 
+// Replaces *contents with the whole file.
+Status ReadEntireFile(Directory& dir, std::string_view name, std::string* contents);
+
 }  // namespace lsmkv

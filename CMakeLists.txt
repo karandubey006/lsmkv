@@ -39,7 +39,9 @@ add_library(lsmkv STATIC
   src/memtable/arena.cc
   src/memtable/memtable.cc
   src/util/coding.cc
+  src/util/crc32c.cc
   src/util/status.cc
+  src/wal/wal.cc
 )
 target_include_directories(lsmkv
   PUBLIC  ${PROJECT_SOURCE_DIR}/include
@@ -71,6 +73,7 @@ if(LSMKV_BUILD_TESTS)
   add_executable(lsmkv_tests
     tests/arena_test.cc
     tests/coding_test.cc
+    tests/crc32c_test.cc
     tests/db_test.cc
     tests/dbformat_test.cc
     tests/differential_test.cc
@@ -79,6 +82,7 @@ if(LSMKV_BUILD_TESTS)
     tests/memtable_test.cc
     tests/skiplist_test.cc
     tests/status_test.cc
+    tests/wal_test.cc
     tests/write_batch_test.cc
   )
   # Tests may include internal headers (env/env.h, util/coding.h, ...).
