@@ -5,6 +5,7 @@
 #include <mutex>
 #include <vector>
 
+#include "db/batch_format.h"
 #include "env/env.h"
 #include "lsmkv/write_batch.h"
 
@@ -57,18 +58,11 @@ class MapDB final : public DB {
     // Decode the whole batch before touching the map, so a malformed batch
     // applies nothing (atomicity). The views point into `batch`, which outlives
     // this call.
-    struct Op {
-      bool is_put;
-      std::string_view key;
-      std::string_view value;
-    };
-    struct Stager final : WriteBatch::Handler {
-      std::vector<Op> ops;
-      void Put(std::string_view k, std::string_view v) override { ops.push_back({true, k, v}); }
-      void Delete(std::string_view k) override { ops.push_back({false, k, {}}); }
-    } stager;
-    Status s = batch.Iterate(stager);
-    if (!s.ok()) return s;
+    std::vector<BatchOp> ops;
+    BatchCursor cursor(batch.Encoded());
+    BatchOp op;
+    while (cursor.Next(&op)) ops.push_back(op);
+    if (!cursor.status().ok()) return cursor.status();
 
     // Holding mu_ for the whole batch means no reader sees half of it.
     std::lock_guard<std::mutex> guard(mu_);
@@ -78,8 +72,8 @@ class MapDB final : public DB {
       current_ = std::move(copy);  // the old Version lives on in its iterators
     }
     Map& map = current_->map;
-    for (const Op& op : stager.ops) {
-      if (op.is_put) {
+    for (const BatchOp& op : ops) {
+      if (op.type == ValueType::kValue) {
         map.insert_or_assign(std::string(op.key), std::string(op.value));
       } else if (auto it = map.find(op.key); it != map.end()) {
         map.erase(it);

@@ -2,34 +2,39 @@
 
 #include <gtest/gtest.h>
 
-#include "db/write_batch_internal.h"
+#include <random>
+
+#include "db/batch_format.h"
 #include "test_util.h"
+#include "util/coding.h"
 
 namespace lsmkv {
 namespace {
 
-// Renders a batch as "Put(k,v)Delete(k)..." to make order easy to assert.
-struct Printer final : WriteBatch::Handler {
+// Renders an encoded batch as "Put(k,v)Delete(k)..." to make order easy to
+// assert, and reports how the cursor stopped.
+std::string Print(std::string_view encoded, Status* status = nullptr) {
+  BatchCursor cursor(encoded);
+  BatchOp op;
   std::string out;
-  void Put(std::string_view k, std::string_view v) override {
-    out += "Put(" + std::string(k) + "," + std::string(v) + ")";
+  while (cursor.Next(&op)) {
+    if (op.type == ValueType::kValue) {
+      out += "Put(" + std::string(op.key) + "," + std::string(op.value) + ")";
+    } else {
+      out += "Delete(" + std::string(op.key) + ")";
+    }
   }
-  void Delete(std::string_view k) override { out += "Delete(" + std::string(k) + ")"; }
-};
-
-std::string Print(const WriteBatch& b, Status* status = nullptr) {
-  Printer p;
-  Status s = b.Iterate(p);
-  if (status != nullptr) *status = s;
-  return p.out;
+  if (status != nullptr) *status = cursor.status();
+  return out;
 }
 
 TEST(WriteBatchTest, Empty) {
   WriteBatch b;
   EXPECT_EQ(b.Count(), 0u);
+  EXPECT_EQ(b.Encoded().size(), kBatchHeaderSize);
   Status s;
-  EXPECT_EQ(Print(b, &s), "");
-  EXPECT_TRUE(s.ok());
+  EXPECT_EQ(Print(b.Encoded(), &s), "");
+  EXPECT_OK(s);
 }
 
 TEST(WriteBatchTest, PreservesOrder) {
@@ -38,7 +43,8 @@ TEST(WriteBatchTest, PreservesOrder) {
   b.Delete("b");
   b.Put("a", "2");
   EXPECT_EQ(b.Count(), 3u);
-  EXPECT_EQ(Print(b), "Put(a,1)Delete(b)Put(a,2)");
+  EXPECT_EQ(Print(b.Encoded()), "Put(a,1)Delete(b)Put(a,2)");
+  EXPECT_OK(ValidateBatch(b.Encoded()));
 }
 
 TEST(WriteBatchTest, Clear) {
@@ -46,75 +52,89 @@ TEST(WriteBatchTest, Clear) {
   b.Put("a", "1");
   b.Clear();
   EXPECT_EQ(b.Count(), 0u);
-  EXPECT_EQ(Print(b), "");
-  EXPECT_EQ(b.ApproximateSize(), WriteBatchInternal::kHeaderSize);
+  EXPECT_EQ(Print(b.Encoded()), "");
+  EXPECT_EQ(b.Encoded().size(), kBatchHeaderSize);
 }
 
 TEST(WriteBatchTest, BinaryKeysAndEmptyValues) {
   WriteBatch b;
   b.Put(std::string_view("k\0x", 3), "");
   b.Put("", "v");
-  struct Collect final : WriteBatch::Handler {
-    std::vector<std::pair<std::string, std::string>> puts;
-    void Put(std::string_view k, std::string_view v) override { puts.emplace_back(k, v); }
-    void Delete(std::string_view) override {}
-  } c;
-  ASSERT_OK(b.Iterate(c));
-  ASSERT_EQ(c.puts.size(), 2u);
-  EXPECT_EQ(c.puts[0].first, std::string("k\0x", 3));
-  EXPECT_EQ(c.puts[0].second, "");
-  EXPECT_EQ(c.puts[1].first, "");
+  BatchCursor cursor(b.Encoded());
+  BatchOp op;
+  ASSERT_TRUE(cursor.Next(&op));
+  EXPECT_EQ(op.key, std::string_view("k\0x", 3));
+  EXPECT_EQ(op.value, "");
+  ASSERT_TRUE(cursor.Next(&op));
+  EXPECT_EQ(op.key, "");
+  EXPECT_EQ(op.value, "v");
+  EXPECT_FALSE(cursor.Next(&op));
+  EXPECT_OK(cursor.status());
 }
 
-TEST(WriteBatchTest, ContentsRoundTrip) {
-  WriteBatch a;
-  a.Put("x", "1");
-  a.Delete("y");
+TEST(WriteBatchTest, OpTypeByteIsTheValueType) {
   WriteBatch b;
-  ASSERT_OK(WriteBatchInternal::SetContents(&b, WriteBatchInternal::Contents(a)));
-  EXPECT_EQ(b.Count(), 2u);
-  EXPECT_EQ(Print(b), "Put(x,1)Delete(y)");
+  b.Delete("k");
+  EXPECT_EQ(b.Encoded()[kBatchHeaderSize], static_cast<char>(ValueType::kDeletion));
 }
 
-TEST(WriteBatchTest, SetContentsRejectsShortHeader) {
+TEST(WriteBatchTest, EveryTruncationIsCorruption) {
   WriteBatch b;
-  EXPECT_TRUE(WriteBatchInternal::SetContents(&b, "ab").IsCorruption());
-}
-
-TEST(WriteBatchTest, TruncatedRecordIsCorruption) {
-  WriteBatch a;
-  a.Put("key", "value");
-  std::string rep(WriteBatchInternal::Contents(a));
-  rep.pop_back();  // cut the last byte of the value
-  WriteBatch b;
-  ASSERT_OK(WriteBatchInternal::SetContents(&b, rep));
-  Status s;
-  Print(b, &s);
-  EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+  b.Put("key", "value");
+  b.Delete("gone");
+  b.Put("", "");
+  const std::string full(b.Encoded());
+  for (size_t cut = 0; cut < full.size(); ++cut) {
+    EXPECT_TRUE(ValidateBatch(full.substr(0, cut)).IsCorruption()) << "cut " << cut;
+  }
+  EXPECT_OK(ValidateBatch(full));
 }
 
 TEST(WriteBatchTest, CountMismatchIsCorruption) {
-  WriteBatch a;
-  a.Put("k", "v");
-  std::string rep(WriteBatchInternal::Contents(a));
-  rep[0] = 2;  // header claims 2 records, body has 1
   WriteBatch b;
-  ASSERT_OK(WriteBatchInternal::SetContents(&b, rep));
+  b.Put("k", "v");
+  std::string bytes(b.Encoded());
+  EncodeFixed32(bytes.data(), 2);  // header claims 2 ops, body has 1
   Status s;
-  Print(b, &s);
+  EXPECT_EQ(Print(bytes, &s), "Put(k,v)");  // the cursor yields ops before it finds out
   EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+  EXPECT_TRUE(ValidateBatch(bytes).IsCorruption());
 }
 
-TEST(WriteBatchTest, UnknownTagIsCorruption) {
-  WriteBatch a;
-  a.Put("k", "v");
-  std::string rep(WriteBatchInternal::Contents(a));
-  rep[WriteBatchInternal::kHeaderSize] = 0x7F;
+TEST(WriteBatchTest, UnknownOpTypeIsCorruption) {
   WriteBatch b;
-  ASSERT_OK(WriteBatchInternal::SetContents(&b, rep));
-  Status s;
-  Print(b, &s);
-  EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+  b.Put("k", "v");
+  std::string bytes(b.Encoded());
+  bytes[kBatchHeaderSize] = 0x7F;
+  EXPECT_TRUE(ValidateBatch(bytes).IsCorruption());
+}
+
+TEST(WriteBatchTest, RandomBytesNeverCrashTheCursor) {
+  std::mt19937 rng(5);
+  for (int i = 0; i < 5000; ++i) {
+    std::string bytes(rng() % 40, '\0');
+    for (char& c : bytes) c = static_cast<char>(rng() % 4 == 0 ? rng() : rng() % 3);
+    Status s = ValidateBatch(bytes);
+    EXPECT_TRUE(s.ok() || s.IsCorruption());
+  }
+}
+
+TEST(WalPayloadTest, RoundTrip) {
+  WriteBatch b;
+  b.Put("k", "v");
+  const std::string payload = EncodeWalPayloadHeader(0x0102030405060708ull) + std::string(b.Encoded());
+  uint64_t seq = 0;
+  std::string_view batch;
+  ASSERT_OK(DecodeWalPayload(payload, &seq, &batch));
+  EXPECT_EQ(seq, 0x0102030405060708ull);
+  EXPECT_EQ(batch, b.Encoded());
+}
+
+TEST(WalPayloadTest, TooShortIsCorruption) {
+  uint64_t seq = 0;
+  std::string_view batch;
+  const std::string payload = EncodeWalPayloadHeader(1) + "abc";  // 3-byte batch header
+  EXPECT_TRUE(DecodeWalPayload(payload, &seq, &batch).IsCorruption());
 }
 
 }  // namespace

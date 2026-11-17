@@ -1,83 +1,94 @@
 #include "lsmkv/write_batch.h"
 
-#include "db/dbformat.h"
-#include "db/write_batch_internal.h"
+#include "db/batch_format.h"
 #include "util/coding.h"
 
 namespace lsmkv {
-namespace {
-
-// Record tags are ValueTypes, so they pass straight through to the memtable.
-using Tag = ValueType;
-
-void SetCount(std::string* rep, uint32_t n) { EncodeFixed32(rep->data(), n); }
-
-}  // namespace
 
 WriteBatch::WriteBatch() { Clear(); }
 
 void WriteBatch::Clear() {
-  rep_.clear();
-  rep_.resize(WriteBatchInternal::kHeaderSize);  // count = 0
+  encoded_.assign(kBatchHeaderSize, '\0');  // count = 0
 }
 
-uint32_t WriteBatch::Count() const { return DecodeFixed32(rep_.data()); }
+uint32_t WriteBatch::Count() const { return DecodeFixed32(encoded_.data()); }
 
 void WriteBatch::Put(std::string_view key, std::string_view value) {
-  SetCount(&rep_, Count() + 1);
-  rep_.push_back(static_cast<char>(Tag::kValue));
-  PutLengthPrefixed(&rep_, key);
-  PutLengthPrefixed(&rep_, value);
+  EncodeFixed32(encoded_.data(), Count() + 1);
+  encoded_.push_back(static_cast<char>(ValueType::kValue));
+  PutLengthPrefixed(&encoded_, key);
+  PutLengthPrefixed(&encoded_, value);
 }
 
 void WriteBatch::Delete(std::string_view key) {
-  SetCount(&rep_, Count() + 1);
-  rep_.push_back(static_cast<char>(Tag::kDeletion));
-  PutLengthPrefixed(&rep_, key);
+  EncodeFixed32(encoded_.data(), Count() + 1);
+  encoded_.push_back(static_cast<char>(ValueType::kDeletion));
+  PutLengthPrefixed(&encoded_, key);
 }
 
-Status WriteBatch::Iterate(Handler& handler) const {
-  std::string_view input(rep_);
-  if (input.size() < WriteBatchInternal::kHeaderSize) {
-    return Status::Corruption("write batch", "shorter than header");
+BatchCursor::BatchCursor(std::string_view batch) : rest_(batch) {
+  if (rest_.size() < kBatchHeaderSize) {
+    Fail("shorter than its header");
+    return;
   }
-  const uint32_t expected = DecodeFixed32(input.data());
-  input.remove_prefix(WriteBatchInternal::kHeaderSize);
-
-  uint32_t found = 0;
-  std::string_view key, value;
-  while (!input.empty()) {
-    const auto tag = static_cast<Tag>(input.front());
-    input.remove_prefix(1);
-    switch (tag) {
-      case Tag::kValue:
-        if (!GetLengthPrefixed(&input, &key) || !GetLengthPrefixed(&input, &value)) {
-          return Status::Corruption("write batch", "bad Put record");
-        }
-        handler.Put(key, value);
-        break;
-      case Tag::kDeletion:
-        if (!GetLengthPrefixed(&input, &key)) {
-          return Status::Corruption("write batch", "bad Delete record");
-        }
-        handler.Delete(key);
-        break;
-      default:
-        return Status::Corruption("write batch", "unknown record tag");
-    }
-    ++found;
-  }
-  if (found != expected) {
-    return Status::Corruption("write batch", "record count does not match header");
-  }
-  return Status::OK();
+  count_ = DecodeFixed32(rest_.data());
+  rest_.remove_prefix(kBatchHeaderSize);
 }
 
-Status WriteBatchInternal::SetContents(WriteBatch* batch, std::string_view contents) {
-  if (contents.size() < kHeaderSize) {
-    return Status::Corruption("write batch", "shorter than header");
+bool BatchCursor::Fail(std::string_view why) {
+  done_ = true;
+  status_ = Status::Corruption("write batch", why);
+  return false;
+}
+
+bool BatchCursor::Next(BatchOp* op) {
+  if (done_) return false;
+  if (rest_.empty()) {
+    done_ = true;
+    if (seen_ != count_) return Fail("op count does not match header");
+    return false;
   }
-  batch->rep_.assign(contents);
+
+  const auto type = static_cast<ValueType>(rest_.front());
+  rest_.remove_prefix(1);
+  switch (type) {
+    case ValueType::kValue:
+      if (!GetLengthPrefixed(&rest_, &op->key) || !GetLengthPrefixed(&rest_, &op->value)) {
+        return Fail("truncated put");
+      }
+      break;
+    case ValueType::kDeletion:
+      if (!GetLengthPrefixed(&rest_, &op->key)) return Fail("truncated delete");
+      op->value = {};
+      break;
+    default:
+      return Fail("unknown op type");
+  }
+  op->type = type;
+  ++seen_;
+  return true;
+}
+
+Status ValidateBatch(std::string_view batch) {
+  BatchCursor cursor(batch);
+  BatchOp op;
+  while (cursor.Next(&op)) {
+  }
+  return cursor.status();
+}
+
+std::string EncodeWalPayloadHeader(uint64_t first_seq) {
+  std::string header(kWalPayloadHeaderSize, '\0');
+  EncodeFixed64(header.data(), first_seq);
+  return header;
+}
+
+Status DecodeWalPayload(std::string_view payload, uint64_t* first_seq, std::string_view* batch) {
+  if (payload.size() < kWalPayloadHeaderSize + kBatchHeaderSize) {
+    return Status::Corruption("WAL payload", "too short");
+  }
+  *first_seq = DecodeFixed64(payload.data());
+  *batch = payload.substr(kWalPayloadHeaderSize);
   return Status::OK();
 }
 
