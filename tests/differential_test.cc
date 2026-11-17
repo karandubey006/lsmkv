@@ -13,12 +13,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <optional>
 #include <random>
 #include <sstream>
 
+#include "env/fault_injection_env.h"
 #include "lsmkv/db.h"
 #include "test_util.h"
 
@@ -27,6 +29,20 @@ namespace {
 
 using Model = std::map<std::string, std::string>;
 using test::Printable;
+
+// The tester is single-threaded, so ThreadSanitizer has nothing to find in it
+// beyond what the threaded tests cover, and it slows the run about 6x.
+#if defined(__SANITIZE_THREAD__)
+constexpr uint64_t kDefaultOps = 10'000;
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+constexpr uint64_t kDefaultOps = 10'000;
+#else
+constexpr uint64_t kDefaultOps = 100'000;
+#endif
+#else
+constexpr uint64_t kDefaultOps = 100'000;
+#endif
 
 uint64_t EnvOr(const char* name, uint64_t fallback) {
   const char* v = std::getenv(name);
@@ -41,7 +57,9 @@ class DifferentialTester {
   static constexpr int kDenseKeys = 2000;
   static constexpr int kAwkwardKeys = 200;
 
-  DifferentialTester(DB* db, uint64_t seed) : db_(db), seed_(seed), rng_(seed) {
+  // reopen closes the DB and opens it again, as a clean restart would.
+  DifferentialTester(std::unique_ptr<DB>& db, std::function<Status()> reopen, uint64_t seed)
+      : db_(db), reopen_(std::move(reopen)), seed_(seed), rng_(seed) {
     awkward_keys_.push_back("");
     for (int i = 0; i < 20; ++i) awkward_keys_.push_back("user" + std::to_string(i));
     while (awkward_keys_.size() < kAwkwardKeys) {
@@ -52,6 +70,11 @@ class DifferentialTester {
   void Run(uint64_t num_ops) {
     num_ops_ = num_ops;
     for (op_index_ = 0; op_index_ < num_ops; ++op_index_) {
+      if (OneIn(5000)) {
+        DoReopen();
+        if (::testing::Test::HasFailure()) return;
+        continue;
+      }
       const uint64_t roll = Uniform(0, 999);
       if (roll < 300)      DoPut();
       else if (roll < 420) DoDelete();
@@ -69,7 +92,8 @@ class DifferentialTester {
               << " puts=" << stats_.puts << " deletes=" << stats_.deletes
               << " batches=" << stats_.batches << " gets=" << stats_.gets
               << " (hits=" << stats_.get_hits << ") scans=" << stats_.scans
-              << " snapshots=" << stats_.snapshots << " final_keys=" << model_.size()
+              << " snapshots=" << stats_.snapshots << " reopens=" << stats_.reopens
+              << " final_keys=" << model_.size()
               << "\n";
   }
 
@@ -217,6 +241,16 @@ class DifferentialTester {
     ExpectFullScanMatches(model_);
   }
 
+  // Every write was acknowledged and the process didn't crash, so recovery
+  // must bring all of them back.
+  void DoReopen() {
+    Record("Reopen");
+    Status s = reopen_();
+    ASSERT_TRUE(s.ok()) << s.ToString() << Context();
+    ExpectFullScanMatches(model_);
+    ++stats_.reopens;
+  }
+
   // ---- checking ------------------------------------------------------------
 
   void ExpectFullScanMatches(const Model& model) {
@@ -267,10 +301,11 @@ class DifferentialTester {
 
   struct Stats {
     uint64_t puts = 0, deletes = 0, batches = 0, gets = 0, get_hits = 0, scans = 0,
-             snapshots = 0;
+             snapshots = 0, reopens = 0;
   };
 
-  DB* const db_;
+  std::unique_ptr<DB>& db_;
+  const std::function<Status()> reopen_;
   const uint64_t seed_;
   std::mt19937_64 rng_;
   std::vector<std::string> awkward_keys_;
@@ -283,16 +318,24 @@ class DifferentialTester {
 
 class DifferentialTest : public ::testing::TestWithParam<uint64_t> {};
 
+// Runs on the in-memory Env: this checks the engine's logic, and real fsyncs
+// would make it take minutes. The crash tests cover the real filesystem.
 TEST_P(DifferentialTest, MatchesStdMapModel) {
-  test::TempDir dir;
+  FaultInjectionEnv env;
   Options options;
   options.create_if_missing = true;
+  options.env = &env;
+  options.memtable_size = 256 << 10;  // small, so memtables rotate often
   std::unique_ptr<DB> db;
-  ASSERT_OK(DB::Open(options, dir.path() + "/db", &db));
+  ASSERT_OK(DB::Open(options, "/db", &db));
+  auto reopen = [&]() {
+    db.reset();
+    return DB::Open(options, "/db", &db);
+  };
 
   const uint64_t seed = EnvOr("LSMKV_DIFF_SEED", GetParam());
-  const uint64_t ops = EnvOr("LSMKV_DIFF_OPS", 100'000);
-  DifferentialTester(db.get(), seed).Run(ops);
+  const uint64_t ops = EnvOr("LSMKV_DIFF_OPS", kDefaultOps);
+  DifferentialTester(db, reopen, seed).Run(ops);
 }
 
 INSTANTIATE_TEST_SUITE_P(Seeds, DifferentialTest, ::testing::Values(1, 2, 3));

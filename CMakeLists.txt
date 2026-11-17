@@ -31,8 +31,11 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(lsmkv STATIC
   src/db/db.cc
+  src/db/db_iterator.cc
   src/db/dbformat.cc
-  src/db/map_db.cc
+  src/db/filenames.cc
+  src/db/lsm_db.cc
+  src/db/merging_iterator.cc
   src/db/write_batch.cc
   src/env/env.cc
   src/env/posix_env.cc
@@ -79,6 +82,7 @@ if(LSMKV_BUILD_TESTS)
     tests/differential_test.cc
     tests/env_test.cc
     tests/fault_injection_env_test.cc
+    tests/lsm_db_test.cc
     tests/memtable_test.cc
     tests/skiplist_test.cc
     tests/status_test.cc

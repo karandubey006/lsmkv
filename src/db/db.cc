@@ -1,12 +1,11 @@
 #include "lsmkv/db.h"
 
-#include "db/map_db.h"
+#include "db/lsm_db.h"
 
 namespace lsmkv {
 
 Status DB::Open(const Options& options, const std::string& name, std::unique_ptr<DB>* dbptr) {
-  // The std::map stand-in, until the LSM-tree engine replaces it.
-  return OpenMapDB(options, name, dbptr);
+  return OpenLsmDB(options, name, dbptr);
 }
 
 Status DB::Put(const WriteOptions& options, std::string_view key, std::string_view value) {
