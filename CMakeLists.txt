@@ -47,6 +47,11 @@ target_include_directories(lsmkv
 )
 target_link_libraries(lsmkv PRIVATE lsmkv_warnings)
 
+# Test-only Env that simulates power loss. Kept out of the engine library.
+add_library(lsmkv_fault_env STATIC src/env/fault_injection_env.cc)
+target_include_directories(lsmkv_fault_env PUBLIC ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(lsmkv_fault_env PUBLIC lsmkv PRIVATE lsmkv_warnings)
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -70,6 +75,7 @@ if(LSMKV_BUILD_TESTS)
     tests/dbformat_test.cc
     tests/differential_test.cc
     tests/env_test.cc
+    tests/fault_injection_env_test.cc
     tests/memtable_test.cc
     tests/skiplist_test.cc
     tests/status_test.cc
@@ -78,7 +84,8 @@ if(LSMKV_BUILD_TESTS)
   # Tests may include internal headers (env/env.h, util/coding.h, ...).
   target_include_directories(lsmkv_tests PRIVATE ${PROJECT_SOURCE_DIR}/src
                                                  ${PROJECT_SOURCE_DIR}/tests)
-  target_link_libraries(lsmkv_tests PRIVATE lsmkv lsmkv_warnings GTest::gtest_main)
+  # lsmkv_fault_env brings in lsmkv; naming both makes the macOS linker warn.
+  target_link_libraries(lsmkv_tests PRIVATE lsmkv_fault_env lsmkv_warnings GTest::gtest_main)
 
   include(GoogleTest)
   gtest_discover_tests(lsmkv_tests DISCOVERY_MODE PRE_TEST)

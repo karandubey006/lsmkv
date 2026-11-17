@@ -120,22 +120,25 @@ SnapshotIterator::~SnapshotIterator() { db_->Unpin(*version_); }
 }  // namespace
 
 Status OpenMapDB(const Options& options, const std::string& name, std::unique_ptr<DB>* dbptr) {
-  Env* env = options.env != nullptr ? options.env : Env::Default();
+  Env* env = options.env != nullptr ? options.env : Env::Posix();
 
-  if (env->FileExists(name)) {
+  std::unique_ptr<Directory> dir;
+  Status s = env->OpenDirectory(name, &dir);
+  if (s.ok()) {
     if (options.error_if_exists) {
       return Status::InvalidArgument(name, "exists (error_if_exists is true)");
     }
-  } else {
+  } else if (s.IsNotFound()) {
     if (!options.create_if_missing) {
       return Status::InvalidArgument(name, "does not exist (create_if_missing is false)");
     }
-    Status s = env->CreateDir(name);
-    if (!s.ok()) return s;
+    s = env->CreateDirectory(name);
+    if (s.ok()) s = env->OpenDirectory(name, &dir);
   }
+  if (!s.ok()) return s;
 
   std::unique_ptr<FileLock> lock;
-  Status s = env->LockFile(name + "/LOCK", &lock);
+  s = dir->Lock("LOCK", &lock);
   if (!s.ok()) return s;
 
   *dbptr = std::make_unique<MapDB>(std::move(lock));

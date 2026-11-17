@@ -9,7 +9,7 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <chrono>
+#include <filesystem>
 #include <system_error>
 
 #include "env/env.h"
@@ -17,7 +17,8 @@
 namespace lsmkv {
 namespace {
 
-constexpr size_t kWritableFileBufferSize = 64 * 1024;
+// macOS rejects single read/write calls over INT_MAX bytes; stay well below.
+constexpr size_t kMaxIoChunk = size_t{1} << 30;
 
 Status PosixError(const std::string& context, int err) {
   std::string msg = std::generic_category().message(err);
@@ -48,50 +49,49 @@ Status SyncFd(int fd, const std::string& name, bool is_dir) {
   return PosixError(name, errno);
 }
 
-class PosixSequentialFile final : public SequentialFile {
+class PosixWritableFile final : public WritableFile {
  public:
-  PosixSequentialFile(std::string filename, int fd)
-      : fd_(fd), filename_(std::move(filename)) {}
-  ~PosixSequentialFile() override { ::close(fd_); }
+  PosixWritableFile(std::string filename, int fd) : fd_(fd), filename_(std::move(filename)) {}
 
-  Status Read(size_t n, std::string_view* result, char* scratch) override {
-    size_t total = 0;
-    while (total < n) {
-      ssize_t r = ::read(fd_, scratch + total, n - total);
-      if (r < 0) {
+  ~PosixWritableFile() override { static_cast<void>(Close()); }
+
+  Status Append(std::string_view data) override {
+    while (!data.empty()) {
+      ssize_t n = ::write(fd_, data.data(), std::min(data.size(), kMaxIoChunk));
+      if (n < 0) {
         if (errno == EINTR) continue;
         return PosixError(filename_, errno);
       }
-      if (r == 0) break;  // end of file
-      total += static_cast<size_t>(r);
+      data.remove_prefix(static_cast<size_t>(n));  // write() may be partial
     }
-    *result = std::string_view(scratch, total);
     return Status::OK();
   }
 
-  Status Skip(uint64_t n) override {
-    if (::lseek(fd_, static_cast<off_t>(n), SEEK_CUR) == static_cast<off_t>(-1)) {
-      return PosixError(filename_, errno);
-    }
+  Status Sync() override { return SyncFd(fd_, filename_, /*is_dir=*/false); }
+
+  Status Close() override {
+    if (fd_ < 0) return Status::OK();
+    int r = ::close(fd_);
+    fd_ = -1;
+    if (r < 0) return PosixError(filename_, errno);
     return Status::OK();
   }
 
  private:
-  const int fd_;
+  int fd_;
   const std::string filename_;
 };
 
-class PosixRandomAccessFile final : public RandomAccessFile {
+class PosixReadableFile final : public ReadableFile {
  public:
-  PosixRandomAccessFile(std::string filename, int fd)
-      : fd_(fd), filename_(std::move(filename)) {}
-  ~PosixRandomAccessFile() override { ::close(fd_); }
+  PosixReadableFile(std::string filename, int fd) : fd_(fd), filename_(std::move(filename)) {}
+  ~PosixReadableFile() override { ::close(fd_); }
 
-  Status Read(uint64_t offset, size_t n, std::string_view* result,
-              char* scratch) const override {
+  Status ReadAt(uint64_t offset, size_t n, std::string_view* result,
+                char* scratch) const override {
     size_t total = 0;
     while (total < n) {
-      ssize_t r = ::pread(fd_, scratch + total, n - total,
+      ssize_t r = ::pread(fd_, scratch + total, std::min(n - total, kMaxIoChunk),
                           static_cast<off_t>(offset + total));
       if (r < 0) {
         if (errno == EINTR) continue;
@@ -104,78 +104,16 @@ class PosixRandomAccessFile final : public RandomAccessFile {
     return Status::OK();
   }
 
- private:
-  const int fd_;
-  const std::string filename_;
-};
-
-class PosixWritableFile final : public WritableFile {
- public:
-  PosixWritableFile(std::string filename, int fd)
-      : fd_(fd), filename_(std::move(filename)) {
-    buf_.reserve(kWritableFileBufferSize);
-  }
-
-  ~PosixWritableFile() override {
-    if (fd_ >= 0) static_cast<void>(Close());  // best effort; errors are lost
-  }
-
-  Status Append(std::string_view data) override {
-    // Fill the buffer as far as possible.
-    size_t n = std::min(data.size(), kWritableFileBufferSize - buf_.size());
-    buf_.append(data.data(), n);
-    data.remove_prefix(n);
-    if (data.empty()) return Status::OK();
-
-    // Buffer is full: write it out, then buffer a small remainder or write a
-    // large one straight through.
-    Status s = FlushBuffer();
-    if (!s.ok()) return s;
-    if (data.size() < kWritableFileBufferSize) {
-      buf_.append(data);
-      return Status::OK();
-    }
-    return WriteUnbuffered(data);
-  }
-
-  Status Flush() override { return FlushBuffer(); }
-
-  Status Sync() override {
-    Status s = FlushBuffer();
-    if (!s.ok()) return s;
-    return SyncFd(fd_, filename_, /*is_dir=*/false);
-  }
-
-  Status Close() override {
-    if (fd_ < 0) return Status::OK();
-    Status s = FlushBuffer();
-    if (::close(fd_) < 0 && s.ok()) s = PosixError(filename_, errno);
-    fd_ = -1;
-    return s;
-  }
-
- private:
-  Status FlushBuffer() {
-    Status s = WriteUnbuffered(buf_);
-    buf_.clear();
-    return s;
-  }
-
-  Status WriteUnbuffered(std::string_view data) {
-    while (!data.empty()) {
-      ssize_t n = ::write(fd_, data.data(), data.size());
-      if (n < 0) {
-        if (errno == EINTR) continue;
-        return PosixError(filename_, errno);
-      }
-      data.remove_prefix(static_cast<size_t>(n));  // write() may be partial
-    }
+  Status Size(uint64_t* size) const override {
+    struct stat st;
+    if (::fstat(fd_, &st) != 0) return PosixError(filename_, errno);
+    *size = static_cast<uint64_t>(st.st_size);
     return Status::OK();
   }
 
-  int fd_;
+ private:
+  const int fd_;
   const std::string filename_;
-  std::string buf_;
 };
 
 class PosixFileLock final : public FileLock {
@@ -190,95 +128,104 @@ class PosixFileLock final : public FileLock {
   const int fd_;
 };
 
-class PosixEnv final : public Env {
+// Holds the directory's fd open for its whole lifetime. Every operation names
+// files relative to that fd (openat, renameat, unlinkat), so the directory
+// that gets synced is exactly the one whose entries changed.
+class PosixDirectory final : public Directory {
  public:
-  Status NewSequentialFile(const std::string& fname,
-                           std::unique_ptr<SequentialFile>* result) override {
-    int fd = ::open(fname.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return PosixError(fname, errno);
-    *result = std::make_unique<PosixSequentialFile>(fname, fd);
+  PosixDirectory(std::string path, int fd) : fd_(fd), path_(std::move(path)) {}
+  ~PosixDirectory() override { ::close(fd_); }
+
+  Status Create(std::string_view name, std::unique_ptr<WritableFile>* file) override {
+    Status s = CheckFileName(name);
+    if (!s.ok()) return s;
+    const std::string n(name);
+    int fd = ::openat(fd_, n.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0) return PosixError(Describe(n), errno);
+    *file = std::make_unique<PosixWritableFile>(Describe(n), fd);
     return Status::OK();
   }
 
-  Status NewRandomAccessFile(const std::string& fname,
-                             std::unique_ptr<RandomAccessFile>* result) override {
-    int fd = ::open(fname.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return PosixError(fname, errno);
-    *result = std::make_unique<PosixRandomAccessFile>(fname, fd);
+  Status Open(std::string_view name, std::unique_ptr<ReadableFile>* file) override {
+    Status s = CheckFileName(name);
+    if (!s.ok()) return s;
+    const std::string n(name);
+    int fd = ::openat(fd_, n.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return PosixError(Describe(n), errno);
+    *file = std::make_unique<PosixReadableFile>(Describe(n), fd);
     return Status::OK();
   }
 
-  Status NewWritableFile(const std::string& fname,
-                         std::unique_ptr<WritableFile>* result) override {
-    int fd = ::open(fname.c_str(), O_TRUNC | O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
-    if (fd < 0) return PosixError(fname, errno);
-    *result = std::make_unique<PosixWritableFile>(fname, fd);
-    return Status::OK();
-  }
-
-  Status NewAppendableFile(const std::string& fname,
-                           std::unique_ptr<WritableFile>* result) override {
-    int fd = ::open(fname.c_str(), O_APPEND | O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
-    if (fd < 0) return PosixError(fname, errno);
-    *result = std::make_unique<PosixWritableFile>(fname, fd);
-    return Status::OK();
-  }
-
-  bool FileExists(const std::string& fname) override {
-    return ::access(fname.c_str(), F_OK) == 0;
-  }
-
-  Status GetChildren(const std::string& dir, std::vector<std::string>* result) override {
-    result->clear();
-    DIR* d = ::opendir(dir.c_str());
-    if (d == nullptr) return PosixError(dir, errno);
-    while (struct dirent* entry = ::readdir(d)) {
-      std::string_view name(entry->d_name);
-      if (name == "." || name == "..") continue;
-      result->emplace_back(name);
-    }
-    ::closedir(d);
-    return Status::OK();
-  }
-
-  Status GetFileSize(const std::string& fname, uint64_t* size) override {
+  Status Truncate(std::string_view name, uint64_t size) override {
+    Status s = CheckFileName(name);
+    if (!s.ok()) return s;
+    const std::string n(name);
+    int fd = ::openat(fd_, n.c_str(), O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return PosixError(Describe(n), errno);
     struct stat st;
-    if (::stat(fname.c_str(), &st) != 0) return PosixError(fname, errno);
-    *size = static_cast<uint64_t>(st.st_size);
-    return Status::OK();
-  }
-
-  Status RemoveFile(const std::string& fname) override {
-    if (::unlink(fname.c_str()) != 0) return PosixError(fname, errno);
-    return Status::OK();
-  }
-
-  Status RenameFile(const std::string& src, const std::string& target) override {
-    if (::rename(src.c_str(), target.c_str()) != 0) return PosixError(src, errno);
-    return Status::OK();
-  }
-
-  Status CreateDir(const std::string& dirname) override {
-    if (::mkdir(dirname.c_str(), 0755) != 0) return PosixError(dirname, errno);
-    return Status::OK();
-  }
-
-  Status RemoveDir(const std::string& dirname) override {
-    if (::rmdir(dirname.c_str()) != 0) return PosixError(dirname, errno);
-    return Status::OK();
-  }
-
-  Status SyncDir(const std::string& dirname) override {
-    int fd = ::open(dirname.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd < 0) return PosixError(dirname, errno);
-    Status s = SyncFd(fd, dirname, /*is_dir=*/true);
+    if (::fstat(fd, &st) != 0) {
+      s = PosixError(Describe(n), errno);
+    } else if (size > static_cast<uint64_t>(st.st_size)) {
+      s = Status::InvalidArgument(Describe(n), "truncate would grow the file");
+    } else if (::ftruncate(fd, static_cast<off_t>(size)) != 0) {
+      s = PosixError(Describe(n), errno);
+    } else {
+      s = SyncFd(fd, Describe(n), /*is_dir=*/false);
+    }
     ::close(fd);
     return s;
   }
 
-  Status LockFile(const std::string& fname, std::unique_ptr<FileLock>* lock) override {
-    int fd = ::open(fname.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (fd < 0) return PosixError(fname, errno);
+  Status Rename(std::string_view from, std::string_view to) override {
+    Status s = CheckFileName(from);
+    if (s.ok()) s = CheckFileName(to);
+    if (!s.ok()) return s;
+    const std::string f(from), t(to);
+    if (::renameat(fd_, f.c_str(), fd_, t.c_str()) != 0) return PosixError(Describe(f), errno);
+    return Status::OK();
+  }
+
+  Status Remove(std::string_view name) override {
+    Status s = CheckFileName(name);
+    if (!s.ok()) return s;
+    const std::string n(name);
+    if (::unlinkat(fd_, n.c_str(), 0) != 0) return PosixError(Describe(n), errno);
+    return Status::OK();
+  }
+
+  Status List(std::vector<std::string>* names) override {
+    names->clear();
+    // A fresh open of "." rather than a dup of fd_: a dup would share fd_'s
+    // read position, leaving the next List() starting at the end.
+    int list_fd = ::openat(fd_, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (list_fd < 0) return PosixError(path_, errno);
+    DIR* d = ::fdopendir(list_fd);
+    if (d == nullptr) {
+      int err = errno;
+      ::close(list_fd);
+      return PosixError(path_, err);
+    }
+    Status s;
+    while (true) {
+      errno = 0;
+      struct dirent* entry = ::readdir(d);
+      if (entry == nullptr) {
+        if (errno != 0) s = PosixError(path_, errno);
+        break;
+      }
+      std::string_view n(entry->d_name);
+      if (n != "." && n != "..") names->emplace_back(n);
+    }
+    ::closedir(d);  // also closes list_fd
+    return s;
+  }
+
+  Status Lock(std::string_view name, std::unique_ptr<FileLock>* lock) override {
+    Status s = CheckFileName(name);
+    if (!s.ok()) return s;
+    const std::string n(name);
+    int fd = ::openat(fd_, n.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) return PosixError(Describe(n), errno);
     // flock locks belong to the open file description, so a second open() of
     // the same file, even from this process, conflicts. (fcntl locks would
     // not: they are per process.)
@@ -286,24 +233,56 @@ class PosixEnv final : public Env {
       int err = errno;
       ::close(fd);
       if (err == EWOULDBLOCK) {
-        return Status::IOError("lock " + fname, "already held by another DB instance");
+        return Status::IOError("lock " + Describe(n), "already held");
       }
-      return PosixError("lock " + fname, err);
+      return PosixError("lock " + Describe(n), err);
     }
     *lock = std::make_unique<PosixFileLock>(fd);
     return Status::OK();
   }
 
-  uint64_t NowMicros() override {
-    auto now = std::chrono::steady_clock::now().time_since_epoch();
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(now).count());
+  Status Sync() override { return SyncFd(fd_, path_, /*is_dir=*/true); }
+
+  const std::string& path() const override { return path_; }
+
+ private:
+  std::string Describe(const std::string& name) const { return path_ + "/" + name; }
+
+  const int fd_;
+  const std::string path_;
+};
+
+std::string ParentOf(const std::string& path) {
+  std::filesystem::path p(path);
+  if (!p.has_filename()) p = p.parent_path();  // "a/b/" names "a/b"
+  std::filesystem::path parent = p.parent_path();
+  return parent.empty() ? "." : parent.string();
+}
+
+class PosixEnv final : public Env {
+ public:
+  Status CreateDirectory(const std::string& path) override {
+    if (::mkdir(path.c_str(), 0755) != 0) return PosixError(path, errno);
+    // The new directory's own name lives in its parent.
+    const std::string parent = ParentOf(path);
+    int fd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return PosixError(parent, errno);
+    Status s = SyncFd(fd, parent, /*is_dir=*/true);
+    ::close(fd);
+    return s;
+  }
+
+  Status OpenDirectory(const std::string& path, std::unique_ptr<Directory>* dir) override {
+    int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return PosixError(path, errno);
+    *dir = std::make_unique<PosixDirectory>(path, fd);
+    return Status::OK();
   }
 };
 
 }  // namespace
 
-Env* Env::Default() {
+Env* Env::Posix() {
   // Intentionally leaked: background threads may still use the Env while
   // static destructors run at exit.
   static Env* const env = new PosixEnv;

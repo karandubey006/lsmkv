@@ -12,7 +12,7 @@ struct Options {
   // Fail Open if the database already exists.
   bool error_if_exists = false;
 
-  // All file I/O goes through this. nullptr means Env::Default() (POSIX).
+  // All file I/O goes through this. nullptr means Env::Posix().
   // Not owned: it must outlive the DB. Tests pass a fault-injection Env here.
   Env* env = nullptr;
 };
