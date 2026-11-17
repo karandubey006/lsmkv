@@ -76,6 +76,7 @@ if(LSMKV_BUILD_TESTS)
   add_executable(lsmkv_tests
     tests/arena_test.cc
     tests/coding_test.cc
+    tests/crash_test.cc
     tests/crc32c_test.cc
     tests/db_test.cc
     tests/dbformat_test.cc

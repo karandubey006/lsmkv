@@ -2,7 +2,7 @@
 
 An embeddable key-value storage engine in C++20, built on a log-structured merge tree (LSM-tree): a write-ahead log, a skip-list memtable, sorted immutable SSTables with bloom filters, and leveled background compaction.
 
-> **Status: early development.** The public API, the file-system abstraction, the build and CI, and a randomized differential tester are in place. The memtable is built and tested on its own: a skip list with one writer and lock-free concurrent readers, an arena allocator, and multi-version internal keys. `DB::Open` still returns a temporary in-memory engine backed by `std::map`, which keeps no data on disk. It is being replaced by the real LSM-tree one component at a time.
+> **Status: early development.** Writes are durable: every write goes to a checksummed write-ahead log and then to a skip-list memtable, and opening a database replays its logs. SSTables, flushing, compaction and bloom filters are not built yet, so the whole database lives in memory and its logs are never deleted.
 
 ## API
 
@@ -33,6 +33,17 @@ for (it->Seek("a"); it->Valid(); it->Next()) { /* it->key(), it->value() */ }
 - Every fallible call returns a `[[nodiscard]] Status`. The engine never throws.
 - A directory can be opened by one `DB` at a time, enforced with a `LOCK` file.
 
+## Durability
+
+A write is **acknowledged** when `Put`, `Delete` or `Write` returns OK.
+
+- **`sync=true`:** the write-ahead log is synced before the call returns (`F_FULLFSYNC` on macOS, `fdatasync` on Linux), so the write survives a process crash, an OS crash and a power loss. It also makes every earlier write durable.
+- **`sync=false`:** the write has been handed to the kernel, so it survives a process crash but may be lost on a power loss.
+- **Prefix recovery:** after any crash, the database holds exactly the writes up to some point in the acknowledged history: a later write never survives while an earlier one is lost.
+- **Atomic batches:** a `WriteBatch` is one log record with one checksum, so after any crash it is either fully applied or absent.
+- **Detected corruption:** each log record carries a CRC32C, so damaged data is never returned. A bad record in the newest log is what a crash leaves behind, so recovery stops there and truncates the log (damage from a failing disk in that log looks the same and is handled the same way). A bad record in any older log, which was fully synced before the next one began, makes `Open` return `Corruption`.
+- **Failed writes stop the database:** after a log write or sync fails, every later write returns that error until the database is reopened, because the log may end in a partial record.
+
 ## Building and testing
 
 Requires CMake 3.25+, Ninja, and GCC 13+ or Clang 17+.
@@ -58,16 +69,31 @@ CI runs every test under ASan + UBSan and ThreadSanitizer, with both GCC and Cla
 LSMKV_DIFF_SEED=42 LSMKV_DIFF_OPS=1000000 ./build/asan/lsmkv_tests --gtest_filter='Seeds/*'
 ```
 
+### Crash testing
+
+`tests/crash_test.cc` crashes the engine at random points and checks, after every recovery, that the database equals the result of some prefix of the operations it ran, and that the prefix includes every write the engine promised to keep.
+
+- **Power loss** runs on an in-memory file system that tracks how much of each file, and which directory entries, were synced. Power fails just before a random file operation (inside a write, a log rotation, or recovery itself), and every unsynced byte is dropped or torn at 512-byte sector granularity. Every `sync=true` write must survive.
+- **Kill** forks a writer on the real file system and `SIGKILL`s it mid-write. Every acknowledged write must survive, synced or not.
+
+Only power-loss mode catches a missing fsync: a killed process loses nothing that reached the kernel. Removing the log sync, the directory sync after creating a log, the old log's sync on rotation, the tail truncation in recovery, or the CRC check each makes the power-loss test fail, while the kill test still passes.
+
+```sh
+LSMKV_CRASH_SEED=17 ./build/asan/lsmkv_tests --gtest_filter='CrashTest.*'
+```
+
 ## Layout
 
 ```
 include/lsmkv/   public API: db.h, options.h, status.h, iterator.h, write_batch.h
-src/env/         Env: the only code that touches the file system (POSIX implementation)
-src/db/          DB::Open, WriteBatch, internal keys (dbformat), the temporary std::map engine
+src/env/         Env: the only code that touches the file system (POSIX, and an in-memory
+                 fault-injecting one for tests)
+src/wal/         write-ahead log record format, writer and reader
+src/db/          the engine (lsm_db), recovery, WriteBatch, internal keys, iterators
 src/memtable/    arena allocator, skip list, memtable
-src/util/        Status, byte encodings
-tests/           unit tests and the differential tester
+src/util/        Status, byte encodings, CRC32C
+tests/           unit tests, the differential tester and the crash tests
 bench/           microbenchmarks (Google Benchmark)
 ```
 
-All file I/O goes through the `Env` interface, so tests can substitute a fault-injecting implementation that simulates power loss by discarding every byte that was never fsynced.
+All file I/O goes through the `Env` interface. File names are changed only through a `Directory` object, which is also the object that syncs them, because a new or renamed file isn't durable until its directory is synced.
