@@ -34,9 +34,9 @@ class FaultInjectionEnv final : public Env {
     // Every file keeps exactly its synced bytes.
     kDropUnsynced,
     // Every file keeps its synced bytes plus none, all, or a random-length
-    // run of its unsynced bytes, in which each 4 KB page independently
-    // survives or reads back as zeros. Models torn writes, zero-filled tails
-    // and out-of-order page writeback.
+    // run of its unsynced bytes, in which each 512-byte sector independently
+    // survives or reads back as zeros. Models torn writes (cut mid-record),
+    // zero-filled tails and out-of-order writeback.
     kTornWrites,
   };
 
@@ -48,6 +48,18 @@ class FaultInjectionEnv final : public Env {
 
   // Deterministic for a given seed and sequence of prior operations.
   void SimulatePowerLoss(PowerLossMode mode, uint64_t seed);
+
+  // Arms a power loss that strikes just before the nth mutating operation
+  // from now (n >= 1). Mutating operations are file Append and Sync, and
+  // directory Create, Truncate, Rename, Remove and Sync. The operation that
+  // triggers it fails, so a crash can land between any two steps of a write.
+  void SchedulePowerLoss(uint64_t n, PowerLossMode mode, uint64_t seed);
+
+  // Number of power losses so far, simulated or scheduled.
+  uint64_t power_losses() const;
+
+  // The next n file Syncs fail with IOError and sync nothing.
+  void FailFileSyncs(int n);
 
   struct State;  // public only so the handle classes in the .cc can name it
 

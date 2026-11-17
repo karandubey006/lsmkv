@@ -12,7 +12,8 @@
 namespace lsmkv {
 namespace {
 
-constexpr uint64_t kPageSize = 4096;
+// Drives persist whole sectors, but a multi-sector write can land partially.
+constexpr uint64_t kSectorSize = 512;
 
 // Invariant: synced <= data.size().
 struct Inode {
@@ -36,6 +37,13 @@ struct FaultInjectionEnv::State {
   // and is dead once they differ.
   uint64_t epoch = 0;
   std::map<std::string, std::shared_ptr<Dir>> dirs;
+
+  // A scheduled power loss: 0 means none is armed.
+  uint64_t mutations_until_loss = 0;
+  PowerLossMode scheduled_mode = PowerLossMode::kDropUnsynced;
+  uint64_t scheduled_seed = 0;
+
+  int failing_syncs = 0;
 };
 
 namespace {
@@ -44,6 +52,18 @@ using State = FaultInjectionEnv::State;
 
 Status PowerLost() { return Status::IOError("simulated power loss"); }
 
+void LosePowerLocked(State& state, FaultInjectionEnv::PowerLossMode mode, uint64_t seed);
+
+// Called, with state.mu held, at the start of every mutating operation.
+Status BeforeMutation(State& state, uint64_t handle_epoch) {
+  if (state.epoch != handle_epoch) return PowerLost();
+  if (state.mutations_until_loss > 0 && --state.mutations_until_loss == 0) {
+    LosePowerLocked(state, state.scheduled_mode, state.scheduled_seed);
+    return PowerLost();
+  }
+  return Status::OK();
+}
+
 class FaultWritableFile final : public WritableFile {
  public:
   FaultWritableFile(std::shared_ptr<State> state, std::shared_ptr<Inode> inode, uint64_t epoch)
@@ -51,7 +71,8 @@ class FaultWritableFile final : public WritableFile {
 
   Status Append(std::string_view data) override {
     std::lock_guard<std::mutex> guard(state_->mu);
-    if (state_->epoch != epoch_) return PowerLost();
+    Status s = BeforeMutation(*state_, epoch_);
+    if (!s.ok()) return s;
     if (closed_) return Status::IOError("append to closed file");
     inode_->data.append(data);
     return Status::OK();
@@ -59,8 +80,13 @@ class FaultWritableFile final : public WritableFile {
 
   Status Sync() override {
     std::lock_guard<std::mutex> guard(state_->mu);
-    if (state_->epoch != epoch_) return PowerLost();
+    Status s = BeforeMutation(*state_, epoch_);
+    if (!s.ok()) return s;
     if (closed_) return Status::IOError("sync of closed file");
+    if (state_->failing_syncs > 0) {
+      --state_->failing_syncs;
+      return Status::IOError("injected sync failure");
+    }
     inode_->synced = inode_->data.size();
     return Status::OK();
   }
@@ -138,7 +164,8 @@ class FaultDirectory final : public Directory {
     Status s = CheckFileName(name);
     if (!s.ok()) return s;
     std::lock_guard<std::mutex> guard(state_->mu);
-    if (state_->epoch != epoch_) return PowerLost();
+    s = BeforeMutation(*state_, epoch_);
+    if (!s.ok()) return s;
     if (dir_->live.contains(name)) return Status::IOError(Describe(name), "already exists");
     auto inode = std::make_shared<Inode>();
     dir_->live.emplace(std::string(name), inode);
@@ -161,7 +188,8 @@ class FaultDirectory final : public Directory {
     Status s = CheckFileName(name);
     if (!s.ok()) return s;
     std::lock_guard<std::mutex> guard(state_->mu);
-    if (state_->epoch != epoch_) return PowerLost();
+    s = BeforeMutation(*state_, epoch_);
+    if (!s.ok()) return s;
     auto it = dir_->live.find(name);
     if (it == dir_->live.end()) return Status::NotFound(Describe(name));
     Inode& inode = *it->second;
@@ -178,7 +206,8 @@ class FaultDirectory final : public Directory {
     if (s.ok()) s = CheckFileName(to);
     if (!s.ok()) return s;
     std::lock_guard<std::mutex> guard(state_->mu);
-    if (state_->epoch != epoch_) return PowerLost();
+    s = BeforeMutation(*state_, epoch_);
+    if (!s.ok()) return s;
     auto it = dir_->live.find(from);
     if (it == dir_->live.end()) return Status::NotFound(Describe(from));
     std::shared_ptr<Inode> inode = std::move(it->second);
@@ -191,7 +220,8 @@ class FaultDirectory final : public Directory {
     Status s = CheckFileName(name);
     if (!s.ok()) return s;
     std::lock_guard<std::mutex> guard(state_->mu);
-    if (state_->epoch != epoch_) return PowerLost();
+    s = BeforeMutation(*state_, epoch_);
+    if (!s.ok()) return s;
     auto it = dir_->live.find(name);
     if (it == dir_->live.end()) return Status::NotFound(Describe(name));
     dir_->live.erase(it);  // open handles keep the inode alive, as with unlink
@@ -220,7 +250,8 @@ class FaultDirectory final : public Directory {
 
   Status Sync() override {
     std::lock_guard<std::mutex> guard(state_->mu);
-    if (state_->epoch != epoch_) return PowerLost();
+    Status s = BeforeMutation(*state_, epoch_);
+    if (!s.ok()) return s;
     dir_->durable = dir_->live;
     return Status::OK();
   }
@@ -246,7 +277,7 @@ void LoseUnsyncedBytes(Inode& inode, FaultInjectionEnv::PowerLossMode mode, std:
   } else {
     // The surviving length is drawn so that the edge cases are common: none
     // of the unsynced bytes, all of them (the new size reached the disk; its
-    // pages may not have), or a uniformly random amount.
+    // sectors may not have), or a uniformly random amount.
     const uint64_t unsynced = data.size() - synced;
     uint64_t keep = 0;
     switch (rng() % 3) {
@@ -255,15 +286,28 @@ void LoseUnsyncedBytes(Inode& inode, FaultInjectionEnv::PowerLossMode mode, std:
       default: keep = synced + rng() % (unsynced + 1); break;
     }
     data.resize(keep);
-    // Pages are aligned to file offsets; the first may begin before `synced`,
-    // but only its unsynced part can be lost.
+    // Sectors are aligned to file offsets; the first may begin before
+    // `synced`, but only its unsynced part can be lost.
     for (uint64_t off = synced; off < keep;) {
-      const uint64_t page_end = std::min(keep, (off / kPageSize + 1) * kPageSize);
-      if (rng() & 1) std::fill(data.begin() + off, data.begin() + page_end, '\0');
-      off = page_end;
+      const uint64_t sector_end = std::min(keep, (off / kSectorSize + 1) * kSectorSize);
+      if (rng() & 1) std::fill(data.begin() + off, data.begin() + sector_end, '\0');
+      off = sector_end;
     }
   }
   inode.synced = data.size();  // what survived is now on the media
+}
+
+void LosePowerLocked(State& state, FaultInjectionEnv::PowerLossMode mode, uint64_t seed) {
+  ++state.epoch;
+  state.mutations_until_loss = 0;
+  std::mt19937_64 rng(seed);
+  // std::map iteration order is sorted, so the rng draws are deterministic.
+  // Each inode has at most one name (no hard links), so none is visited twice.
+  for (auto& [path, dir] : state.dirs) {
+    dir->live = dir->durable;
+    dir->locked.clear();
+    for (auto& [name, inode] : dir->durable) LoseUnsyncedBytes(*inode, mode, rng);
+  }
 }
 
 }  // namespace
@@ -289,15 +333,24 @@ Status FaultInjectionEnv::OpenDirectory(const std::string& path, std::unique_ptr
 
 void FaultInjectionEnv::SimulatePowerLoss(PowerLossMode mode, uint64_t seed) {
   std::lock_guard<std::mutex> guard(state_->mu);
-  ++state_->epoch;
-  std::mt19937_64 rng(seed);
-  // std::map iteration order is sorted, so the rng draws are deterministic.
-  // Each inode has at most one name (no hard links), so none is visited twice.
-  for (auto& [path, dir] : state_->dirs) {
-    dir->live = dir->durable;
-    dir->locked.clear();
-    for (auto& [name, inode] : dir->durable) LoseUnsyncedBytes(*inode, mode, rng);
-  }
+  LosePowerLocked(*state_, mode, seed);
+}
+
+void FaultInjectionEnv::SchedulePowerLoss(uint64_t n, PowerLossMode mode, uint64_t seed) {
+  std::lock_guard<std::mutex> guard(state_->mu);
+  state_->mutations_until_loss = n;
+  state_->scheduled_mode = mode;
+  state_->scheduled_seed = seed;
+}
+
+uint64_t FaultInjectionEnv::power_losses() const {
+  std::lock_guard<std::mutex> guard(state_->mu);
+  return state_->epoch;
+}
+
+void FaultInjectionEnv::FailFileSyncs(int n) {
+  std::lock_guard<std::mutex> guard(state_->mu);
+  state_->failing_syncs = n;
 }
 
 }  // namespace lsmkv

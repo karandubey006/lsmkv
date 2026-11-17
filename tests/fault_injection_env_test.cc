@@ -187,9 +187,9 @@ std::string SurvivorAfterTornWrite(const std::string& synced, const std::string&
   return std::string(got);
 }
 
-TEST(FaultInjectionTornWrites, PreserveSyncedBytesAndMangleOnlyWholePages) {
-  const std::string synced(5000, 's');  // ends partway through page 1
-  std::string unsynced(3 * 4096, '\0');
+TEST(FaultInjectionTornWrites, PreserveSyncedBytesAndMangleOnlyWholeSectors) {
+  const std::string synced(5000, 's');  // ends partway through a sector
+  std::string unsynced(6 * 512 + 100, '\0');
   for (size_t i = 0; i < unsynced.size(); ++i) unsynced[i] = static_cast<char>('a' + i % 26);
   const std::string full = synced + unsynced;
 
@@ -202,28 +202,28 @@ TEST(FaultInjectionTornWrites, PreserveSyncedBytesAndMangleOnlyWholePages) {
     ASSERT_LE(got.size(), full.size()) << "seed " << seed;
     ASSERT_EQ(got.substr(0, synced.size()), synced) << "seed " << seed;
 
-    // Each 4 KB page of the unsynced part is either intact or all zeros.
-    bool zero_page_seen = false, last_page_zeroed = false;
+    // Each 512-byte sector of the unsynced part is either intact or all zeros.
+    bool zero_sector_seen = false, last_sector_zeroed = false;
     for (size_t off = synced.size(); off < got.size();) {
-      const size_t end = std::min(got.size(), (off / 4096 + 1) * 4096);
-      const std::string_view page = std::string_view(got).substr(off, end - off);
-      const bool intact = page == std::string_view(full).substr(off, end - off);
-      const bool zeroed = std::all_of(page.begin(), page.end(), [](char c) { return c == 0; });
+      const size_t end = std::min(got.size(), (off / 512 + 1) * 512);
+      const std::string_view sector = std::string_view(got).substr(off, end - off);
+      const bool intact = sector == std::string_view(full).substr(off, end - off);
+      const bool zeroed = std::all_of(sector.begin(), sector.end(), [](char c) { return c == 0; });
       ASSERT_TRUE(intact || zeroed) << "seed " << seed << " offset " << off;
-      if (intact && zero_page_seen) saw_hole_before_data = true;
-      zero_page_seen |= zeroed;
-      last_page_zeroed = zeroed;
+      if (intact && zero_sector_seen) saw_hole_before_data = true;
+      zero_sector_seen |= zeroed;
+      last_sector_zeroed = zeroed;
       off = end;
     }
     saw_nothing_kept |= got.size() == synced.size();
     saw_partial |= got.size() > synced.size() && got.size() < full.size();
-    saw_zero_tail_at_full_length |= got.size() == full.size() && last_page_zeroed;
+    saw_zero_tail_at_full_length |= got.size() == full.size() && last_sector_zeroed;
   }
   // The mode really produces each shape the WAL reader must survive.
   EXPECT_TRUE(saw_nothing_kept);
   EXPECT_TRUE(saw_partial);
   EXPECT_TRUE(saw_zero_tail_at_full_length);
-  EXPECT_TRUE(saw_hole_before_data);  // a lost page followed by a surviving one
+  EXPECT_TRUE(saw_hole_before_data);  // a lost sector followed by a surviving one
 }
 
 }  // namespace
