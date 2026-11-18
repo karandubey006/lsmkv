@@ -180,8 +180,12 @@ TEST_P(TableRoundTrip, ScanAndSeek) {
   const auto [block_size, restart_interval] = GetParam();
   const Entries entries = SampleEntries(1500);
   WriteTable("t.sst", entries, {block_size, restart_interval});
-  if (block_size == 1) EXPECT_EQ(num_data_blocks_, entries.size());
-  if (block_size >= (1 << 20)) EXPECT_EQ(num_data_blocks_, 1u);
+  if (block_size == 1) {
+    EXPECT_EQ(num_data_blocks_, entries.size());
+  }
+  if (block_size >= (1 << 20)) {
+    EXPECT_EQ(num_data_blocks_, 1u);
+  }
 
   std::unique_ptr<SstReader> table;
   ASSERT_OK(OpenTable("t.sst", &table));
