@@ -41,6 +41,11 @@ add_library(lsmkv STATIC
   src/env/posix_env.cc
   src/memtable/arena.cc
   src/memtable/memtable.cc
+  src/table/block_reader.cc
+  src/table/block_writer.cc
+  src/table/format.cc
+  src/table/sst_reader.cc
+  src/table/sst_writer.cc
   src/util/coding.cc
   src/util/crc32c.cc
   src/util/status.cc
@@ -56,6 +61,11 @@ target_link_libraries(lsmkv PRIVATE lsmkv_warnings)
 add_library(lsmkv_fault_env STATIC src/env/fault_injection_env.cc)
 target_include_directories(lsmkv_fault_env PUBLIC ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(lsmkv_fault_env PUBLIC lsmkv PRIVATE lsmkv_warnings)
+
+# Prints the contents of an SST file: sst_dump <path-to-.sst>
+add_executable(sst_dump tools/sst_dump.cc)
+target_include_directories(sst_dump PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(sst_dump PRIVATE lsmkv lsmkv_warnings)
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -75,6 +85,7 @@ if(LSMKV_BUILD_TESTS)
 
   add_executable(lsmkv_tests
     tests/arena_test.cc
+    tests/block_test.cc
     tests/coding_test.cc
     tests/crash_test.cc
     tests/crc32c_test.cc
@@ -87,6 +98,7 @@ if(LSMKV_BUILD_TESTS)
     tests/memtable_test.cc
     tests/skiplist_test.cc
     tests/status_test.cc
+    tests/table_test.cc
     tests/wal_test.cc
     tests/write_batch_test.cc
   )
