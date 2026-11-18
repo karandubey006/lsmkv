@@ -35,7 +35,10 @@ add_library(lsmkv STATIC
   src/db/dbformat.cc
   src/db/filenames.cc
   src/db/lsm_db.cc
+  src/db/manifest.cc
   src/db/merging_iterator.cc
+  src/db/version.cc
+  src/db/version_edit.cc
   src/db/write_batch.cc
   src/env/env.cc
   src/env/posix_env.cc
@@ -95,10 +98,12 @@ if(LSMKV_BUILD_TESTS)
     tests/env_test.cc
     tests/fault_injection_env_test.cc
     tests/lsm_db_test.cc
+    tests/manifest_test.cc
     tests/memtable_test.cc
     tests/skiplist_test.cc
     tests/status_test.cc
     tests/table_test.cc
+    tests/version_edit_test.cc
     tests/wal_test.cc
     tests/write_batch_test.cc
   )
