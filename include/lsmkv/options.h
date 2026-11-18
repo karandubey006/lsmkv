@@ -21,6 +21,14 @@ struct Options {
   // Once the in-memory table of recent writes reaches about this many bytes,
   // it is sealed and a new one (with a new write-ahead log) takes writes.
   size_t memtable_size = 4 << 20;
+
+  // Target size of a data block in a table file. A block is closed once it
+  // reaches this size, so it can run over by one entry.
+  size_t block_size = 4 << 10;
+
+  // Number of entries between restart points in a data block: a full key is
+  // stored every this many entries, and the rest are prefix-compressed.
+  int block_restart_interval = 16;
 };
 
 // Per-write options.

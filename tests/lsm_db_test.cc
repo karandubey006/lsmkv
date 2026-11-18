@@ -10,6 +10,7 @@
 
 #include "db/batch_format.h"
 #include "db/filenames.h"
+#include "db/lsm_db.h"
 #include "env/fault_injection_env.h"
 #include "lsmkv/db.h"
 #include "test_util.h"
@@ -60,16 +61,19 @@ class LsmDBTest : public ::testing::Test {
     return dir;
   }
 
-  std::vector<uint64_t> WalNumbers() {
+  std::vector<uint64_t> Numbers(FileKind kind) {
     std::vector<std::string> names;
     EXPECT_OK(Dir()->List(&names));
-    std::vector<uint64_t> wals;
+    std::vector<uint64_t> numbers;
     for (const auto& n : names) {
-      if (auto number = ParseWalFileName(n)) wals.push_back(*number);
+      auto parsed = ParseFileName(n);
+      if (parsed && parsed->kind == kind) numbers.push_back(parsed->number);
     }
-    std::sort(wals.begin(), wals.end());
-    return wals;
+    std::sort(numbers.begin(), numbers.end());
+    return numbers;
   }
+  std::vector<uint64_t> WalNumbers() { return Numbers(FileKind::kWal); }
+  std::vector<uint64_t> SstNumbers() { return Numbers(FileKind::kSst); }
 
   // Replaces a file's contents, durably.
   void Rewrite(const std::string& name, std::string_view contents) {
@@ -144,9 +148,9 @@ TEST_F(LsmDBTest, SyncedWriteMakesEarlierUnsyncedWritesDurable) {
 TEST_F(LsmDBTest, RotationKeepsRecoveryAPrefix) {
   options_.memtable_size = 4096;
   ASSERT_OK(Reopen());
-  const size_t wals_before = WalNumbers().size();
+  const uint64_t wal_before = WalNumbers().back();
   int unsynced = 0;
-  while (WalNumbers().size() == wals_before) {
+  while (WalNumbers().back() == wal_before) {
     ASSERT_OK(db_->Put(WriteOptions(), "u" + std::to_string(unsynced), std::string(200, 'x')));
     ++unsynced;
   }
@@ -156,22 +160,74 @@ TEST_F(LsmDBTest, RotationKeepsRecoveryAPrefix) {
   for (int i = 0; i < unsynced; ++i) EXPECT_EQ(Get("u" + std::to_string(i)), std::string(200, 'x'));
 }
 
-TEST_F(LsmDBTest, ReadsSpanSealedMemtables) {
+TEST_F(LsmDBTest, ReadsSpanMemtablesAndTables) {
   options_.memtable_size = 4096;
   ASSERT_OK(Reopen());
   for (int i = 0; i < 500; ++i) ASSERT_OK(db_->Put(WriteOptions(), "k" + std::to_string(i % 50), std::to_string(i)));
   ASSERT_OK(db_->Delete(WriteOptions(), "k7"));
-  EXPECT_GT(WalNumbers().size(), 3u);
-  EXPECT_EQ(Get("k3"), "453");
-  EXPECT_EQ(Get("k7"), "NOT_FOUND");
-  auto it = db_->NewIterator(ReadOptions());
-  int n = 0;
-  for (it->SeekToFirst(); it->Valid(); it->Next()) ++n;
-  ASSERT_OK(it->status());
-  EXPECT_EQ(n, 49);
+  ASSERT_OK(FlushForTesting(*db_));
+  EXPECT_GT(SstNumbers().size(), 3u);
+  EXPECT_EQ(WalNumbers().size(), 1u);  // flushed WALs are removed
+  for (int pass = 0; pass < 2; ++pass) {
+    SCOPED_TRACE(pass == 0 ? "before reopen" : "after reopen");
+    EXPECT_EQ(Get("k3"), "453");
+    EXPECT_EQ(Get("k7"), "NOT_FOUND");
+    auto it = db_->NewIterator(ReadOptions());
+    int n = 0;
+    for (it->SeekToFirst(); it->Valid(); it->Next()) ++n;
+    ASSERT_OK(it->status());
+    EXPECT_EQ(n, 49);
+    ASSERT_OK(Reopen());
+  }
 }
 
-TEST_F(LsmDBTest, TornTailIsDroppedAndTruncated) {
+TEST_F(LsmDBTest, NewestTableWins) {
+  ASSERT_OK(db_->Put(WriteOptions(), "k", "1"));
+  ASSERT_OK(FlushForTesting(*db_));
+  ASSERT_OK(db_->Put(WriteOptions(), "k", "2"));
+  ASSERT_OK(FlushForTesting(*db_));
+  EXPECT_EQ(Get("k"), "2");
+  ASSERT_OK(db_->Delete(WriteOptions(), "k"));
+  ASSERT_OK(FlushForTesting(*db_));
+  EXPECT_EQ(SstNumbers().size(), 3u);
+  EXPECT_EQ(Get("k"), "NOT_FOUND");
+  ASSERT_OK(Reopen());
+  EXPECT_EQ(Get("k"), "NOT_FOUND");
+  ASSERT_OK(db_->Put(WriteOptions(), "k", "3"));
+  EXPECT_EQ(Get("k"), "3");
+}
+
+TEST_F(LsmDBTest, IteratorKeepsItsSnapshotAcrossAFlush) {
+  ASSERT_OK(db_->Put(WriteOptions(), "a", "old"));
+  auto it = db_->NewIterator(ReadOptions());
+  ASSERT_OK(db_->Put(WriteOptions(), "a", "new"));
+  ASSERT_OK(db_->Put(WriteOptions(), "b", "new"));
+  ASSERT_OK(FlushForTesting(*db_));
+  it->SeekToFirst();
+  ASSERT_TRUE(it->Valid());
+  EXPECT_EQ(it->key(), "a");
+  EXPECT_EQ(it->value(), "old");
+  it->Next();
+  EXPECT_FALSE(it->Valid());
+  ASSERT_OK(it->status());
+}
+
+TEST_F(LsmDBTest, FailedFlushIsStickyAndRecoverable) {
+  ASSERT_OK(db_->Put(WriteOptions(), "a", "1"));
+  env_.FailFileSyncs(1, ".sst");  // the flush thread's SST sync
+  EXPECT_TRUE(FlushForTesting(*db_).IsIOError());
+  EXPECT_TRUE(db_->Put(WriteOptions(), "b", "2").IsIOError());
+  EXPECT_EQ(Get("a"), "1");  // reads still work
+  // The WAL was kept, so a reopen recovers "a" and removes the orphan SST.
+  ASSERT_OK(Reopen());
+  EXPECT_EQ(Get("a"), "1");
+  EXPECT_EQ(SstNumbers().size(), 1u);
+  ASSERT_OK(db_->Put(WriteOptions(), "b", "2"));
+  ASSERT_OK(FlushForTesting(*db_));
+  EXPECT_EQ(Get("b"), "2");
+}
+
+TEST_F(LsmDBTest, TornTailIsDropped) {
   ASSERT_OK(db_->Put(WriteOptions(), "a", "1"));
   ASSERT_OK(db_->Put(WriteOptions(), "b", "2"));
   db_.reset();
@@ -182,21 +238,24 @@ TEST_F(LsmDBTest, TornTailIsDroppedAndTruncated) {
   ASSERT_OK(Reopen());
   EXPECT_EQ(Get("a"), "1");
   EXPECT_EQ(Get("b"), "NOT_FOUND");
-  // The torn bytes are gone for good, so the next open, when this WAL is no
-  // longer the newest, doesn't mistake them for corruption.
-  EXPECT_LT(ReadWal(wal).size(), contents.size() - 3);
+  // Recovery flushed "a" and moved past the torn WAL, which is now removed.
+  const std::vector<uint64_t> wals = WalNumbers();
+  EXPECT_EQ(std::count(wals.begin(), wals.end(), wal), 0);
   ASSERT_OK(db_->Put(WriteOptions(), "c", "3"));
   ASSERT_OK(Reopen());
   EXPECT_EQ(Get("a"), "1");
+  EXPECT_EQ(Get("b"), "NOT_FOUND");
   EXPECT_EQ(Get("c"), "3");
 }
 
 TEST_F(LsmDBTest, DamageInAnOlderWalIsCorruption) {
-  ASSERT_OK(db_->Put(WriteOptions(), "a", "1"));
-  ASSERT_OK(Reopen());  // "a" is now in an older WAL
-  ASSERT_OK(db_->Put(WriteOptions(), "b", "2"));
+  ASSERT_OK(db_->Put(WriteOptions(), "a", "1"));  // sequence 1
   db_.reset();
-  const uint64_t older = WalNumbers().front();
+  // A newer WAL, as if the memtable had rotated and not yet been flushed.
+  const uint64_t older = WalNumbers().back();
+  WriteBatch b;
+  b.Put("b", "2");
+  WriteWal(older + 1, EncodeWalPayloadHeader(2) + std::string(b.Encoded()));
   std::string contents = ReadWal(older);
   contents.back() ^= 0x01;
   Rewrite(WalFileName(older), contents);
@@ -298,7 +357,7 @@ TEST_F(LsmDBTest, ConcurrentReadsDuringRotation) {
   writer.join();
   for (auto& t : readers) t.join();
   EXPECT_EQ(errors.load(), 0);
-  EXPECT_GT(WalNumbers().size(), 10u);
+  EXPECT_GT(SstNumbers().size(), 10u);
   EXPECT_EQ(Get("a"), std::to_string(kBatches));
 }
 

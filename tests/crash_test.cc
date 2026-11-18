@@ -31,6 +31,7 @@
 #include <sstream>
 #include <vector>
 
+#include "db/lsm_db.h"
 #include "env/fault_injection_env.h"
 #include "lsmkv/db.h"
 #include "test_util.h"
@@ -207,6 +208,103 @@ TEST(CrashTest, PowerLossKeepsEverySyncedWriteAndAPrefix) {
   const uint64_t seeds = EnvOr("LSMKV_CRASH_SEEDS", 300);
   for (uint64_t seed = 0; seed < seeds && !::testing::Test::HasFailure(); ++seed) {
     RunPowerLossSeed(seed);
+  }
+}
+
+// Writes 300 unsynced operations on the kKeys keys and returns the result.
+State WriteUnsynced(DB& db, uint64_t seed) {
+  std::mt19937_64 rng(seed);
+  State model;
+  for (int i = 0; i < 300; ++i) {
+    const std::string key = "k" + std::to_string(rng() % kKeys);
+    if (rng() % 5 == 0) {
+      EXPECT_OK(db.Delete(WriteOptions(), key));
+      model.erase(key);
+    } else {
+      const std::string value = std::to_string(i) + std::string(rng() % 100, 'v');
+      EXPECT_OK(db.Put(WriteOptions(), key, value));
+      model[key] = value;
+    }
+  }
+  return model;
+}
+
+// Torn writes keep a random subset of unsynced data and name changes, so each
+// step is tried with several seeds.
+constexpr std::pair<Mode, uint64_t> kStepModes[] = {{Mode::kDropUnsynced, 1},
+                                                    {Mode::kTornWrites, 8}};
+
+// Power fails just before each mutating step of a flush in turn: the
+// rotation (WAL sync, new WAL, directory sync), then the SST appends, SST
+// sync, directory sync, MANIFEST append and sync, and WAL removal. Every
+// write made before the flush is durable (the last one is synced), so all of
+// it must survive wherever the crash lands, and the database must open.
+TEST(CrashTest, PowerLossAtEveryStepOfAFlush) {
+  for (const auto& [mode, seeds] : kStepModes) {
+    for (uint64_t step = 1, seed = 0;; seed = (seed + 1) % seeds, step += seed == 0) {
+      SCOPED_TRACE("mode " + std::to_string(static_cast<int>(mode)) + ", step " +
+                   std::to_string(step) + ", seed " + std::to_string(seed));
+      FaultInjectionEnv env;
+      Options options;
+      options.create_if_missing = true;
+      options.env = &env;
+      options.block_size = 256;  // several data blocks, so several appends
+      std::unique_ptr<DB> db;
+      ASSERT_OK(DB::Open(options, "/db", &db));
+      State model = WriteUnsynced(*db, /*seed=*/1);  // the same steps every time
+      ASSERT_OK(db->Put(WriteOptions{.sync = true}, "k0", "synced"));
+      model["k0"] = "synced";
+
+      env.SchedulePowerLoss(step, mode, seed);
+      const Status flushed = FlushForTesting(*db);
+      const bool crashed = env.power_losses() > 0;
+      // A crash while removing obsolete files, after the commit, isn't an error.
+      ASSERT_TRUE(flushed.ok() || crashed) << flushed.ToString();
+      db.reset();
+      if (!crashed) env.SimulatePowerLoss(mode, seed);
+
+      ASSERT_OK(DB::Open(options, "/db", &db));
+      ASSERT_EQ(ReadAll(*db), model);
+      // A second open finds the same state, so recovery left nothing behind
+      // (an orphan SST or a stale WAL) that changes its mind later.
+      db.reset();
+      ASSERT_OK(DB::Open(options, "/db", &db));
+      ASSERT_EQ(ReadAll(*db), model);
+      if (!crashed) break;  // the operation finished before step `step`
+    }
+  }
+}
+
+// The same for recovery, which replays the WAL, writes a new MANIFEST,
+// flushes, commits, creates a WAL and removes obsolete files.
+TEST(CrashTest, PowerLossAtEveryStepOfRecovery) {
+  for (const auto& [mode, seeds] : kStepModes) {
+    for (uint64_t step = 1, seed = 0;; seed = (seed + 1) % seeds, step += seed == 0) {
+      SCOPED_TRACE("mode " + std::to_string(static_cast<int>(mode)) + ", step " +
+                   std::to_string(step) + ", seed " + std::to_string(seed));
+      FaultInjectionEnv env;
+      Options options;
+      options.create_if_missing = true;
+      options.env = &env;
+      options.block_size = 256;
+      std::unique_ptr<DB> db;
+      ASSERT_OK(DB::Open(options, "/db", &db));
+      State model = WriteUnsynced(*db, /*seed=*/1);  // the same steps every time
+      ASSERT_OK(db->Put(WriteOptions{.sync = true}, "k0", "synced"));  // makes all of it durable
+      model["k0"] = "synced";
+      db.reset();
+
+      env.SchedulePowerLoss(step, mode, seed);
+      const Status opened = DB::Open(options, "/db", &db);
+      const bool crashed = env.power_losses() > 0;
+      ASSERT_TRUE(opened.ok() || crashed) << opened.ToString();
+      db.reset();
+      if (!crashed) env.SimulatePowerLoss(mode, seed);
+
+      ASSERT_OK(DB::Open(options, "/db", &db));
+      ASSERT_EQ(ReadAll(*db), model);
+      if (!crashed) break;  // the operation finished before step `step`
+    }
   }
 }
 
