@@ -26,7 +26,12 @@ using NameTable = std::map<std::string, std::shared_ptr<Inode>, std::less<>>;
 struct Dir {
   NameTable live;
   NameTable durable;
+  // live after each name change since the last Sync, oldest first. A power
+  // loss in kTornWrites mode keeps a random prefix of these changes.
+  std::vector<NameTable> unsynced;
   std::set<std::string, std::less<>> locked;
+
+  void NameChanged() { unsynced.push_back(live); }
 };
 
 }  // namespace
@@ -44,6 +49,7 @@ struct FaultInjectionEnv::State {
   uint64_t scheduled_seed = 0;
 
   int failing_syncs = 0;
+  std::string failing_sync_suffix;  // only files whose name ends with this
 };
 
 namespace {
@@ -66,8 +72,9 @@ Status BeforeMutation(State& state, uint64_t handle_epoch) {
 
 class FaultWritableFile final : public WritableFile {
  public:
-  FaultWritableFile(std::shared_ptr<State> state, std::shared_ptr<Inode> inode, uint64_t epoch)
-      : state_(std::move(state)), inode_(std::move(inode)), epoch_(epoch) {}
+  FaultWritableFile(std::shared_ptr<State> state, std::shared_ptr<Inode> inode, uint64_t epoch,
+                    std::string name)
+      : state_(std::move(state)), inode_(std::move(inode)), epoch_(epoch), name_(std::move(name)) {}
 
   Status Append(std::string_view data) override {
     std::lock_guard<std::mutex> guard(state_->mu);
@@ -83,7 +90,7 @@ class FaultWritableFile final : public WritableFile {
     Status s = BeforeMutation(*state_, epoch_);
     if (!s.ok()) return s;
     if (closed_) return Status::IOError("sync of closed file");
-    if (state_->failing_syncs > 0) {
+    if (state_->failing_syncs > 0 && name_.ends_with(state_->failing_sync_suffix)) {
       --state_->failing_syncs;
       return Status::IOError("injected sync failure");
     }
@@ -101,6 +108,7 @@ class FaultWritableFile final : public WritableFile {
   const std::shared_ptr<State> state_;
   const std::shared_ptr<Inode> inode_;
   const uint64_t epoch_;
+  const std::string name_;
   bool closed_ = false;  // guarded by state_->mu
 };
 
@@ -169,7 +177,8 @@ class FaultDirectory final : public Directory {
     if (dir_->live.contains(name)) return Status::IOError(Describe(name), "already exists");
     auto inode = std::make_shared<Inode>();
     dir_->live.emplace(std::string(name), inode);
-    *file = std::make_unique<FaultWritableFile>(state_, std::move(inode), epoch_);
+    dir_->NameChanged();
+    *file = std::make_unique<FaultWritableFile>(state_, std::move(inode), epoch_, std::string(name));
     return Status::OK();
   }
 
@@ -213,6 +222,7 @@ class FaultDirectory final : public Directory {
     std::shared_ptr<Inode> inode = std::move(it->second);
     dir_->live.erase(it);
     dir_->live.insert_or_assign(std::string(to), std::move(inode));
+    dir_->NameChanged();
     return Status::OK();
   }
 
@@ -225,6 +235,7 @@ class FaultDirectory final : public Directory {
     auto it = dir_->live.find(name);
     if (it == dir_->live.end()) return Status::NotFound(Describe(name));
     dir_->live.erase(it);  // open handles keep the inode alive, as with unlink
+    dir_->NameChanged();
     return Status::OK();
   }
 
@@ -253,6 +264,7 @@ class FaultDirectory final : public Directory {
     Status s = BeforeMutation(*state_, epoch_);
     if (!s.ok()) return s;
     dir_->durable = dir_->live;
+    dir_->unsynced.clear();
     return Status::OK();
   }
 
@@ -304,6 +316,13 @@ void LosePowerLocked(State& state, FaultInjectionEnv::PowerLossMode mode, uint64
   // std::map iteration order is sorted, so the rng draws are deterministic.
   // Each inode has at most one name (no hard links), so none is visited twice.
   for (auto& [path, dir] : state.dirs) {
+    // Journaling filesystems apply name changes in order, so what survives
+    // is the synced names plus some prefix of the later changes.
+    const size_t kept = mode == FaultInjectionEnv::PowerLossMode::kTornWrites
+                            ? rng() % (dir->unsynced.size() + 1)
+                            : 0;
+    if (kept > 0) dir->durable = std::move(dir->unsynced[kept - 1]);
+    dir->unsynced.clear();
     dir->live = dir->durable;
     dir->locked.clear();
     for (auto& [name, inode] : dir->durable) LoseUnsyncedBytes(*inode, mode, rng);
@@ -348,9 +367,10 @@ uint64_t FaultInjectionEnv::power_losses() const {
   return state_->epoch;
 }
 
-void FaultInjectionEnv::FailFileSyncs(int n) {
+void FaultInjectionEnv::FailFileSyncs(int n, std::string name_suffix) {
   std::lock_guard<std::mutex> guard(state_->mu);
   state_->failing_syncs = n;
+  state_->failing_sync_suffix = std::move(name_suffix);
 }
 
 }  // namespace lsmkv

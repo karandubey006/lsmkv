@@ -10,8 +10,9 @@
 //
 // SimulatePowerLoss() resets every directory's live names to its durable
 // names, so unsynced creates, renames and removes are undone, and cuts every
-// surviving file back to its synced bytes (or, in kTornWrites mode, keeps a
-// random mangling of the unsynced bytes). Directories made by
+// surviving file back to its synced bytes. In kTornWrites mode each directory
+// instead keeps a random prefix of its unsynced name changes, and each file
+// a random mangling of its unsynced bytes. Directories made by
 // CreateDirectory() are durable on return, as with the POSIX Env.
 //
 // Handles (directories, files, locks) opened before a power loss belong to
@@ -36,7 +37,9 @@ class FaultInjectionEnv final : public Env {
     // Every file keeps its synced bytes plus none, all, or a random-length
     // run of its unsynced bytes, in which each 512-byte sector independently
     // survives or reads back as zeros. Models torn writes (cut mid-record),
-    // zero-filled tails and out-of-order writeback.
+    // zero-filled tails and out-of-order writeback. Every directory keeps its
+    // synced names plus a random prefix (possibly none, possibly all) of its
+    // later creates, renames and removes, in the order they were made.
     kTornWrites,
   };
 
@@ -58,8 +61,9 @@ class FaultInjectionEnv final : public Env {
   // Number of power losses so far, simulated or scheduled.
   uint64_t power_losses() const;
 
-  // The next n file Syncs fail with IOError and sync nothing.
-  void FailFileSyncs(int n);
+  // The next n file Syncs fail with IOError and sync nothing. With a suffix,
+  // only Syncs of files whose name ends with it count.
+  void FailFileSyncs(int n, std::string name_suffix = "");
 
   struct State;  // public only so the handle classes in the .cc can name it
 
